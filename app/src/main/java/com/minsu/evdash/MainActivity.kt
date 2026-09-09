@@ -14,7 +14,9 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -29,7 +31,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -49,7 +53,7 @@ import kotlin.math.abs
 /** 배터리 직렬 셀 수. 52V 팩 = 14S (3.7V × 14 = 51.8V) */
 private const val CELL_COUNT = 14
 
-/** 출력 게이지 최대 눈금(W). 차 최고출력에 맞춰 조절. */
+/** 출력 게이지(상단 LED 바) 최대 눈금(W). 차 최고출력에 맞춰 조절. */
 private const val POWER_GAUGE_MAX = 12000f
 
 /** 출력 구간별 색상 경계(W) */
@@ -57,31 +61,34 @@ private const val PWR_GREEN_MAX = 6000f
 private const val PWR_YELLOW_MAX = 8000f
 private const val PWR_ORANGE_MAX = 9500f
 
-/** 이보다 큰 음수 전류가 흐르면 충전/회생제동으로 본다 (A). 노이즈로 깜빡이지 않게. */
+/** 이보다 큰 음수 전류가 흐르면 충전/회생제동으로 본다 (A) */
 private const val CHARGING_THRESHOLD_A = 0.5f
 
 /**
  * 배터리 온도 경계(℃).
  * 리튬이온은 방전 0~60℃, 충전 0~45℃가 일반적인 사용 범위다.
- * 60℃ 넘어가면 셀 수명이 급격히 깎이고 그 위로는 위험 구간이다.
- * 레이스 중 팩 온도는 보통 25~40℃, 45 넘어가면 식혀야 한다.
  */
-private const val TEMP_WARN_C = 45f    // 주의 (노랑)
-private const val TEMP_ALERT_C = 55f   // 경보 (빨강)
-private const val TEMP_COLD_C = 0f     // 저온 주의 - 이 아래선 충전 금지
+private const val TEMP_WARN_C = 45f
+private const val TEMP_ALERT_C = 55f
+private const val TEMP_COLD_C = 0f
 
-private val GREEN = Color(0xFF4CD964)
+/** 상단 LED 바 개수 */
+private const val LED_COUNT = 20
+
+private val GREEN = Color(0xFF34D058)
 private val YELLOW = Color(0xFFFFD60A)
 private val ORANGE = Color(0xFFFF9500)
 private val RED = Color(0xFFFF3B30)
-private val TRACK = Color(0xFF2C2C2E)
-private val LABEL_GRAY = Color(0xFF8E8E93)
+private val CYAN = Color(0xFF32ADE6)
+
+private val PANEL = Color(0xFF17171A)        // 패널 배경
+private val CELL_LABEL = Color(0xFF3A3A3E)   // 표 라벨칸
+private val CELL_VALUE = Color(0xFF0E0E10)   // 표 값칸
+private val LED_OFF = Color(0xFF232326)
+private val LABEL_GRAY = Color(0xFF9A9AA0)
 private val CARD_BG = Color(0xFF2C2C2E)
 
-/**
- * 리튬이온 셀 전압 → 잔량(%) 방전곡선.
- * 단순 비례(선형)로 하면 중간 구간이 평평해서 실제와 크게 어긋난다.
- */
+/** 리튬이온 셀 전압 → 잔량(%) 방전곡선 */
 private val SOC_CURVE = listOf(
     4.20f to 100f, 4.10f to 92f, 4.00f to 85f, 3.90f to 74f,
     3.85f to 68f, 3.80f to 62f, 3.75f to 56f, 3.70f to 50f,
@@ -90,7 +97,6 @@ private val SOC_CURVE = listOf(
     3.00f to 0f
 )
 
-/** 팩 전압 → 잔량(%) */
 fun voltageToPercent(packVoltage: Float): Float {
     if (packVoltage <= 0f) return 0f
     val cell = packVoltage / CELL_COUNT
@@ -107,7 +113,6 @@ fun voltageToPercent(packVoltage: Float): Float {
     return 0f
 }
 
-/** 출력(W) 구간별 색상. 회생제동 음수는 절댓값으로 판정. */
 fun powerColorFor(watt: Float): Color = when {
     watt <= PWR_GREEN_MAX -> GREEN
     watt <= PWR_YELLOW_MAX -> YELLOW
@@ -115,27 +120,25 @@ fun powerColorFor(watt: Float): Color = when {
     else -> RED
 }
 
-/** 배터리 온도 색상 */
+fun batteryColorFor(pct: Float): Color = when {
+    pct > 50f -> GREEN
+    pct > 30f -> YELLOW
+    pct > 15f -> ORANGE
+    else -> RED
+}
+
 fun tempColorFor(c: Float): Color = when {
     c >= TEMP_ALERT_C -> RED
     c >= TEMP_WARN_C -> YELLOW
-    c < TEMP_COLD_C -> YELLOW      // 영하에서 충전하면 셀이 상한다
+    c < TEMP_COLD_C -> YELLOW
     else -> GREEN
 }
 
-/** 온도 상태 문구. 정상이면 빈 문자열 */
 fun tempLabelFor(c: Float): String = when {
     c >= TEMP_ALERT_C -> "경보"
     c >= TEMP_WARN_C -> "주의"
     c < TEMP_COLD_C -> "저온"
-    else -> ""
-}
-
-/** 배터리 잔량 색상 */
-fun batteryColorFor(pct: Float): Color = when {
-    pct > 50f -> GREEN
-    pct > 20f -> YELLOW
-    else -> RED
+    else -> "정상"
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -148,13 +151,15 @@ class MainActivity : ComponentActivity() {
     private var voltage by mutableStateOf(0f)
     private var current by mutableStateOf(0f)
     private var soc by mutableStateOf(0f)
-    private var tempC by mutableStateOf(Float.NaN)   // NaN = 아직 못 받음
+    private var tempC by mutableStateOf(Float.NaN)
     private var speedKmh by mutableStateOf(0f)
+    private var maxSpeed by mutableStateOf(0f)
     private var bleConnected by mutableStateOf(false)
     private var bleLog by mutableStateOf("연결 버튼을 눌러 BMS를 찾으세요.")
     private var scanResults by mutableStateOf<List<BleDevice>>(emptyList())
     private var isScanning by mutableStateOf(false)
     private var connectedName by mutableStateOf("")
+    private var gpsActive by mutableStateOf(false)
 
     private val prefs by lazy { getSharedPreferences("evdash", Context.MODE_PRIVATE) }
 
@@ -163,6 +168,7 @@ class MainActivity : ComponentActivity() {
     ) { result ->
         if (result.values.all { it }) {
             gpsTracker.start()
+            gpsActive = true
             autoReconnect()
         } else {
             bleLog = "권한이 거부되어 BLE/GPS를 사용할 수 없습니다."
@@ -172,9 +178,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 화면 항상 켜짐 (계기판이므로)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        // 완전 몰입형 전체화면
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->
             controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -199,7 +203,10 @@ class MainActivity : ComponentActivity() {
                     .putString("last_name", name).apply()
             }
         )
-        gpsTracker = GpsSpeedTracker(this) { speedKmh = it }
+        gpsTracker = GpsSpeedTracker(this) { v ->
+            speedKmh = v
+            if (v > maxSpeed) maxSpeed = v
+        }
 
         setContent {
             DashboardScreen(
@@ -208,7 +215,9 @@ class MainActivity : ComponentActivity() {
                 soc = soc,
                 tempC = tempC,
                 speedKmh = speedKmh,
+                maxSpeed = maxSpeed,
                 bleConnected = bleConnected,
+                gpsActive = gpsActive,
                 bleLog = bleLog,
                 scanResults = scanResults,
                 isScanning = isScanning,
@@ -221,14 +230,14 @@ class MainActivity : ComponentActivity() {
                 onForgetDevice = {
                     prefs.edit().remove("last_address").remove("last_name").apply()
                     bleLog = "기억된 기기를 지웠습니다."
-                }
+                },
+                onResetMax = { maxSpeed = 0f }
             )
         }
 
         requestNeededPermissions()
     }
 
-    /** 저장된 기기가 있으면 앱 켜자마자 자동 연결 */
     private fun autoReconnect() {
         val addr = prefs.getString("last_address", null) ?: return
         val name = prefs.getString("last_name", "저장된 기기")
@@ -261,7 +270,9 @@ fun DashboardScreen(
     soc: Float,
     tempC: Float,
     speedKmh: Float,
+    maxSpeed: Float,
     bleConnected: Boolean,
+    gpsActive: Boolean,
     bleLog: String,
     scanResults: List<BleDevice>,
     isScanning: Boolean,
@@ -271,37 +282,28 @@ fun DashboardScreen(
     onStopScan: () -> Unit,
     onPickDevice: (BleDevice) -> Unit,
     onConnectByAddress: (String) -> Unit,
-    onForgetDevice: () -> Unit
+    onForgetDevice: () -> Unit,
+    onResetMax: () -> Unit
 ) {
     var showConnectDialog by remember { mutableStateOf(false) }
 
     val power = voltage * current
     val powerAbs = abs(power)
     val powerAccent = powerColorFor(powerAbs)
-
     val batteryPct = voltageToPercent(voltage)
     val batteryAccent = batteryColorFor(batteryPct)
-
-    // 전류가 음수 = 배터리로 전기가 들어오는 중 = 충전 / 회생제동
     val isCharging = current < -CHARGING_THRESHOLD_A
-
-    // 충전 중엔 구간 색상을 무시하고 초록 고정. 숫자는 마이너스로 표시된다.
     val powerDisplayColor = if (isCharging) GREEN else powerAccent
 
-    // 게이지가 뚝뚝 끊기지 않게 부드럽게 이동
     val animBattery by animateFloatAsState(targetValue = batteryPct, label = "battery")
     val animPower by animateFloatAsState(targetValue = powerAbs, label = "power")
 
-    // 충전 중 번개 깜빡임
-    val boltPulse = rememberInfiniteTransition(label = "bolt")
-    val boltAlpha by boltPulse.animateFloat(
-        initialValue = 0.35f,
+    val pulse = rememberInfiniteTransition(label = "pulse")
+    val pulseAlpha by pulse.animateFloat(
+        initialValue = 0.3f,
         targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(700),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "boltAlpha"
+        animationSpec = infiniteRepeatable(tween(650), repeatMode = RepeatMode.Reverse),
+        label = "pulseAlpha"
     )
 
     BoxWithConstraints(
@@ -309,243 +311,295 @@ fun DashboardScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // 화면 높이에 맞춰 글자 크기 자동 조절 (폰/태블릿/에뮬 전부 대응)
         val h = maxHeight.value
+        val w = maxWidth.value
 
-        val pctSize = (h * 0.25f).coerceIn(56f, 170f)
-        val speedSize = (h * 0.40f).coerceIn(80f, 260f)
-        val powerSize = (h * 0.20f).coerceIn(46f, 130f)
-        val labelSize = (h * 0.055f).coerceIn(14f, 30f)
-        val unitSize = (h * 0.050f).coerceIn(13f, 28f)
-        val smallSize = (h * 0.070f).coerceIn(16f, 38f)
-        val barH = (h * 0.045f).coerceIn(8f, 26f)
-        val barW = (h * 0.050f).coerceIn(10f, 30f)
+        val ledSize = (h * 0.030f).coerceIn(7f, 20f)
+        val logoH = (h * 0.105f).coerceIn(22f, 70f)
+        val rowH = (h * 0.082f).coerceIn(20f, 54f)
+        val chipText = (h * 0.038f).coerceIn(9f, 22f)
+        val cellText = (h * 0.048f).coerceIn(11f, 28f)
+        val speedSize = (h * 0.30f).coerceIn(64f, 190f)
+        val pctSize = (h * 0.155f).coerceIn(34f, 100f)
+        val midSize = (h * 0.105f).coerceIn(24f, 68f)
+        val tinyText = (h * 0.034f).coerceIn(8f, 20f)
+        val gap = (h * 0.018f).coerceIn(3f, 12f)
 
-        Row(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = (w * 0.014f).dp, vertical = (h * 0.022f).dp)
+        ) {
 
-            // ══ 왼쪽: 배터리 잔량 (메인) + 전압/전류 ══
-            Column(
+            // ══════ 상단 LED 바 (출력) ══════
+            PowerLedStrip(
+                fraction = animPower / POWER_GAUGE_MAX,
+                dotSize = ledSize,
+                overLimit = powerAbs > PWR_ORANGE_MAX,
+                pulseAlpha = pulseAlpha
+            )
+
+            Spacer(modifier = Modifier.height(gap.dp))
+
+            // ══════ 팀 로고 ══════
+            Image(
+                painter = painterResource(id = R.drawable.team_logo),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
                 modifier = Modifier
-                    .weight(1.15f)
-                    .fillMaxHeight()
-                    .padding(horizontal = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = if (isCharging) "충전 중" else "배터리",
-                    color = if (isCharging) YELLOW else LABEL_GRAY,
-                    fontSize = labelSize.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1
-                )
+                    .height(logoH.dp)
+                    .align(Alignment.CenterHorizontally)
+            )
 
-                Row(verticalAlignment = Alignment.Bottom) {
-                    if (isCharging) {
-                        BoltIcon(
-                            sizeDp = pctSize * 0.45f,
-                            color = YELLOW.copy(alpha = boltAlpha),
-                            modifier = Modifier.padding(
-                                end = 4.dp,
-                                bottom = (pctSize * 0.14f).dp
-                            )
+            Spacer(modifier = Modifier.height(gap.dp))
+
+            // ══════ 본체 3분할 ══════
+            Row(modifier = Modifier.fillMaxWidth().weight(1f)) {
+
+                // ───── 왼쪽: 상태칩 + 데이터 표 ─────
+                Row(modifier = Modifier.weight(1.08f)) {
+
+                    Column(modifier = Modifier.width((w * 0.062f).coerceIn(38f, 96f).dp)) {
+                        StatusChip(
+                            "BMS",
+                            if (bleConnected) "ON" else "OFF",
+                            if (bleConnected) GREEN else RED,
+                            chipText, rowH,
+                            onClick = { showConnectDialog = true }
+                        )
+                        Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+                        StatusChip(
+                            "GPS",
+                            if (gpsActive) "ON" else "OFF",
+                            if (gpsActive) GREEN else LABEL_GRAY,
+                            chipText, rowH
+                        )
+                        Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+                        StatusChip(
+                            "MODE",
+                            if (isCharging) "CHG" else "RUN",
+                            if (isCharging) GREEN else CYAN,
+                            chipText, rowH
                         )
                     }
-                    Text(
-                        text = "%.0f".format(batteryPct),
-                        color = batteryAccent,
-                        fontSize = pctSize.sp,
-                        lineHeight = (pctSize * 1.15f).sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        softWrap = false
-                    )
-                    Text(
-                        text = "%",
-                        color = batteryAccent.copy(alpha = 0.75f),
-                        fontSize = unitSize.sp,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.padding(
-                            start = 3.dp,
-                            bottom = (pctSize * 0.10f).dp
+
+                    Spacer(modifier = Modifier.width((gap * 0.6f).dp))
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        DataRow("전압", "%.1f".format(voltage), "V", Color.White, cellText, rowH)
+                        Spacer(modifier = Modifier.height(2.dp))
+                        DataRow(
+                            "전류", "%.1f".format(current), "A",
+                            if (isCharging) GREEN else Color.White, cellText, rowH
                         )
-                    )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        DataRow("SOC", "%.0f".format(soc), "%", Color.White, cellText, rowH)
+                        Spacer(modifier = Modifier.height(2.dp))
+                        DataRow(
+                            "온도",
+                            if (tempC.isNaN()) "--" else "%.0f".format(tempC),
+                            "\u2103",
+                            if (tempC.isNaN()) LABEL_GRAY else tempColorFor(tempC),
+                            cellText, rowH
+                        )
+                    }
                 }
 
-                Spacer(modifier = Modifier.height((h * 0.025f).dp))
+                Spacer(modifier = Modifier.width((gap * 0.8f).dp))
 
-                HorizontalBar(
-                    fraction = animBattery / 100f,
-                    color = if (isCharging) YELLOW else batteryAccent,
-                    thickness = barH,
-                    modifier = Modifier.fillMaxWidth(0.88f)
-                )
-
-                Spacer(modifier = Modifier.height((h * 0.05f).dp))
-
-                Row(
-                    verticalAlignment = Alignment.Bottom,
-                    horizontalArrangement = Arrangement.Center
+                // ───── 가운데: 배터리% / 속도 / 출력 ─────
+                Column(
+                    modifier = Modifier.weight(0.92f),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    SmallReading("%.1f".format(voltage), "V", GREEN, smallSize, unitSize * 0.8f)
-                    Spacer(modifier = Modifier.width((h * 0.045f).dp))
-                    SmallReading(
-                        "%.1f".format(current), "A",
-                        if (isCharging) YELLOW else ORANGE,
-                        smallSize, unitSize * 0.8f
-                    )
+                    // 배터리 % (레퍼런스의 속도 박스 자리)
+                    Panel(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.padding(vertical = (gap * 0.4f).dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            if (isCharging) {
+                                BoltIcon(
+                                    sizeDp = midSize * 0.85f,
+                                    color = GREEN.copy(alpha = pulseAlpha),
+                                    modifier = Modifier.padding(end = 5.dp)
+                                )
+                            }
+                            Text(
+                                "%.0f".format(batteryPct),
+                                color = batteryAccent,
+                                fontSize = midSize.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                            Text(
+                                "%",
+                                color = batteryAccent.copy(alpha = 0.7f),
+                                fontSize = tinyText.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(start = 3.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+
+                    // 속도 (히어로)
+                    Panel(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Text(
+                                "%.0f".format(speedKmh),
+                                color = Color.White,
+                                fontSize = speedSize.sp,
+                                lineHeight = (speedSize * 1.05f).sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                            Text(
+                                "km/h",
+                                color = LABEL_GRAY,
+                                fontSize = tinyText.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+
+                    // 출력 (레퍼런스의 TYRE PRESS 자리 - 테두리 강조)
+                    TitledBox(
+                        title = "출력",
+                        accent = powerDisplayColor,
+                        titleSize = tinyText,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.Bottom,
+                            modifier = Modifier.padding(vertical = (gap * 0.3f).dp)
+                        ) {
+                            Text(
+                                "%.0f".format(power),
+                                color = powerDisplayColor,
+                                fontSize = midSize.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                softWrap = false
+                            )
+                            Text(
+                                "W",
+                                color = powerDisplayColor.copy(alpha = 0.7f),
+                                fontSize = tinyText.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(start = 3.dp, bottom = 3.dp)
+                            )
+                        }
+                    }
                 }
 
-                Spacer(modifier = Modifier.height((h * 0.028f).dp))
+                Spacer(modifier = Modifier.width((gap * 0.8f).dp))
 
-                // 배터리 온도
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(
-                        text = "온도",
-                        color = LABEL_GRAY,
-                        fontSize = (unitSize * 0.85f).sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        modifier = Modifier.padding(
-                            end = 6.dp,
-                            bottom = (smallSize * 0.10f).dp
-                        )
-                    )
-                    if (tempC.isNaN()) {
-                        SmallReading("--", "\u2103", LABEL_GRAY, smallSize, unitSize * 0.8f)
-                    } else {
-                        SmallReading(
-                            "%.0f".format(tempC), "\u2103",
-                            tempColorFor(tempC), smallSize, unitSize * 0.8f
-                        )
-                        val warn = tempLabelFor(tempC)
-                        if (warn.isNotEmpty()) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Surface(
-                                color = tempColorFor(tempC),
-                                shape = RoundedCornerShape(4.dp),
-                                modifier = Modifier.padding(bottom = (smallSize * 0.10f).dp)
+                // ───── 오른쪽: 배터리 게이지 / 온도 / 최고속도 ─────
+                Column(modifier = Modifier.weight(1.08f)) {
+
+                    // 배터리 잔량 블록
+                    Panel(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            HeaderBar("배터리 잔량", tinyText, rowH * 0.62f)
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 8.dp),
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.Bottom,
+                                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                                ) {
+                                    Text(
+                                        "%.0f".format(batteryPct),
+                                        color = batteryAccent,
+                                        fontSize = pctSize.sp,
+                                        lineHeight = (pctSize * 1.05f).sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        softWrap = false
+                                    )
+                                    Text(
+                                        "%",
+                                        color = batteryAccent.copy(alpha = 0.7f),
+                                        fontSize = (tinyText * 1.15f).sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(start = 3.dp, bottom = 5.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+                                HorizontalBar(
+                                    fraction = animBattery / 100f,
+                                    color = batteryAccent,
+                                    thickness = (rowH * 0.30f).coerceIn(6f, 18f),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+
+                    // 온도 상태 + 최고속도
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        TitledBox(
+                            title = "온도",
+                            accent = if (tempC.isNaN()) LABEL_GRAY else tempColorFor(tempC),
+                            titleSize = tinyText,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                if (tempC.isNaN()) "--" else tempLabelFor(tempC),
+                                color = if (tempC.isNaN()) LABEL_GRAY else tempColorFor(tempC),
+                                fontSize = (tinyText * 1.35f).sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                modifier = Modifier.padding(vertical = (gap * 0.35f).dp)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width((gap * 0.5f).dp))
+
+                        TitledBox(
+                            title = "최고속도",
+                            accent = CYAN,
+                            titleSize = tinyText,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onResetMax() }
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.Bottom,
+                                modifier = Modifier.padding(vertical = (gap * 0.35f).dp)
                             ) {
                                 Text(
-                                    warn,
-                                    color = Color.Black,
-                                    fontSize = (unitSize * 0.75f).sp,
+                                    "%.0f".format(maxSpeed),
+                                    color = CYAN,
+                                    fontSize = (tinyText * 1.35f).sp,
                                     fontWeight = FontWeight.Bold,
-                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                    maxLines = 1
+                                )
+                                Text(
+                                    "km/h",
+                                    color = CYAN.copy(alpha = 0.6f),
+                                    fontSize = (tinyText * 0.8f).sp,
+                                    modifier = Modifier.padding(start = 2.dp)
                                 )
                             }
                         }
                     }
                 }
-            }
-
-            GaugeDivider()
-
-            // ══ 가운데: 속도 (하얀색, 제일 크게) ══
-            Column(
-                modifier = Modifier
-                    .weight(1.4f)
-                    .fillMaxHeight(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Text(
-                    text = "속도",
-                    color = LABEL_GRAY,
-                    fontSize = (labelSize * 1.2f).sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1
-                )
-                Text(
-                    text = "%.0f".format(speedKmh),
-                    color = Color.White,
-                    fontSize = speedSize.sp,
-                    lineHeight = (speedSize * 1.15f).sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    softWrap = false
-                )
-                Text(
-                    text = "km/h",
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = (unitSize * 1.3f).sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1
-                )
-            }
-
-            GaugeDivider()
-
-            // ══ 오른쪽: 출력(W) + 세로 게이지 ══
-            Row(
-                modifier = Modifier
-                    .weight(1.3f)
-                    .fillMaxHeight()
-                    .padding(horizontal = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "출력",
-                        color = LABEL_GRAY,
-                        fontSize = labelSize.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1
-                    )
-                    Text(
-                        text = "%.0f".format(power),
-                        color = powerDisplayColor,
-                        fontSize = powerSize.sp,
-                        lineHeight = (powerSize * 1.15f).sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        softWrap = false
-                    )
-                    Text(
-                        text = "W",
-                        color = powerDisplayColor.copy(alpha = 0.75f),
-                        fontSize = unitSize.sp,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1
-                    )
-                }
-
-                Spacer(modifier = Modifier.width((h * 0.035f).dp))
-
-                VerticalBar(
-                    fraction = animPower / POWER_GAUGE_MAX,
-                    color = powerDisplayColor,
-                    thickness = barW,
-                    modifier = Modifier.fillMaxHeight(0.62f)
-                )
-            }
-        }
-
-        // 좌상단 상태 표시 + 연결 버튼
-        Row(
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(10.dp)
-                    .background(if (bleConnected) GREEN else RED, shape = CircleShape)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = if (bleConnected)
-                    "$connectedName (BMS SOC ${"%.0f".format(soc)}%)"
-                else "BMS 미연결",
-                color = Color.Gray,
-                fontSize = 12.sp,
-                maxLines = 1
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            TextButton(onClick = { showConnectDialog = true }) {
-                Text("연결", fontSize = 12.sp, color = Color.Gray)
             }
         }
     }
@@ -565,13 +619,213 @@ fun DashboardScreen(
     }
 }
 
-/** 충전 표시용 번개 아이콘. 외부 아이콘 라이브러리 없이 직접 그린다. */
+// ═══════════════════ 계기판 구성요소 ═══════════════════
+
+/** 상단 출력 LED 바. 왼쪽부터 차오르고 구간별로 색이 바뀐다. */
 @Composable
-fun BoltIcon(
-    sizeDp: Float,
-    color: Color,
-    modifier: Modifier = Modifier
+fun PowerLedStrip(
+    fraction: Float,
+    dotSize: Float,
+    overLimit: Boolean,
+    pulseAlpha: Float
 ) {
+    val lit = (fraction.coerceIn(0f, 1f) * LED_COUNT)
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        for (i in 0 until LED_COUNT) {
+            val isOn = i < lit
+            val zoneColor = when {
+                i < LED_COUNT * 0.50f -> GREEN
+                i < LED_COUNT * 0.70f -> YELLOW
+                i < LED_COUNT * 0.87f -> ORANGE
+                else -> RED
+            }
+            // 한계 초과면 전체가 빨갛게 깜빡인다
+            val color = when {
+                overLimit -> RED.copy(alpha = pulseAlpha)
+                isOn -> zoneColor
+                else -> LED_OFF
+            }
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = (dotSize * 0.16f).dp)
+                    .size(dotSize.dp)
+                    .background(color, CircleShape)
+            )
+        }
+    }
+}
+
+/** 테두리만 있는 작은 상태 표시칩 */
+@Composable
+fun StatusChip(
+    label: String,
+    value: String,
+    accent: Color,
+    textSize: Float,
+    height: Float,
+    onClick: (() -> Unit)? = null
+) {
+    val base = Modifier
+        .fillMaxWidth()
+        .height(height.dp)
+        .border(1.dp, accent.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+    Box(
+        modifier = if (onClick != null) base.clickable { onClick() } else base,
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                label,
+                color = LABEL_GRAY,
+                fontSize = (textSize * 0.8f).sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1
+            )
+            Text(
+                value,
+                color = accent,
+                fontSize = textSize.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+/** 회색 라벨칸 + 어두운 값칸으로 된 표 한 줄 */
+@Composable
+fun DataRow(
+    label: String,
+    value: String,
+    unit: String,
+    valueColor: Color,
+    textSize: Float,
+    height: Float
+) {
+    Row(modifier = Modifier.fillMaxWidth().height(height.dp)) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(topStart = 4.dp, bottomStart = 4.dp))
+                .background(CELL_LABEL)
+                .padding(horizontal = 7.dp),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                label,
+                color = Color.White,
+                fontSize = (textSize * 0.88f).sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1
+            )
+        }
+        Row(
+            modifier = Modifier
+                .weight(1.15f)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(topEnd = 4.dp, bottomEnd = 4.dp))
+                .background(CELL_VALUE)
+                .padding(horizontal = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End
+        ) {
+            Text(
+                value,
+                color = valueColor,
+                fontSize = textSize.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                softWrap = false
+            )
+            Text(
+                unit,
+                color = valueColor.copy(alpha = 0.6f),
+                fontSize = (textSize * 0.7f).sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(start = 2.dp)
+            )
+        }
+    }
+}
+
+/** 기본 패널 (모서리 둥근 어두운 박스) */
+@Composable
+fun Panel(
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(PANEL),
+        contentAlignment = Alignment.Center,
+        content = content
+    )
+}
+
+/** 제목줄이 색으로 강조된 박스 */
+@Composable
+fun TitledBox(
+    title: String,
+    accent: Color,
+    titleSize: Float,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .border(1.dp, accent.copy(alpha = 0.8f), RoundedCornerShape(6.dp))
+            .background(PANEL),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(accent.copy(alpha = 0.18f))
+                .padding(vertical = 1.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                title,
+                color = accent,
+                fontSize = (titleSize * 0.92f).sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+        }
+        content()
+    }
+}
+
+/** 패널 상단 회색 제목줄 */
+@Composable
+fun HeaderBar(title: String, textSize: Float, height: Float) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(height.dp)
+            .background(CELL_LABEL),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            title,
+            color = Color.White,
+            fontSize = textSize.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+    }
+}
+
+/** 충전 표시용 번개 아이콘 */
+@Composable
+fun BoltIcon(sizeDp: Float, color: Color, modifier: Modifier = Modifier) {
     Canvas(modifier = modifier.size(width = (sizeDp * 0.62f).dp, height = sizeDp.dp)) {
         val w = size.width
         val hh = size.height
@@ -587,6 +841,33 @@ fun BoltIcon(
         drawPath(path, color)
     }
 }
+
+/** 가로 막대 게이지 */
+@Composable
+fun HorizontalBar(
+    fraction: Float,
+    color: Color,
+    thickness: Float,
+    modifier: Modifier = Modifier
+) {
+    val shape = RoundedCornerShape((thickness / 2f).dp)
+    Box(
+        modifier = modifier
+            .height(thickness.dp)
+            .clip(shape)
+            .background(LED_OFF)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(fraction.coerceIn(0f, 1f))
+                .fillMaxHeight()
+                .clip(shape)
+                .background(color)
+        )
+    }
+}
+
+// ═══════════════════ 연결 다이얼로그 ═══════════════════
 
 @Composable
 fun ConnectDialog(
@@ -605,10 +886,7 @@ fun ConnectDialog(
     val clipboard = LocalClipboardManager.current
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            color = Color(0xFF1C1C1E),
-            shape = RoundedCornerShape(16.dp)
-        ) {
+        Surface(color = Color(0xFF1C1C1E), shape = RoundedCornerShape(16.dp)) {
             Column(
                 modifier = Modifier
                     .padding(20.dp)
@@ -664,9 +942,7 @@ fun ConnectDialog(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Row {
-                    TextButton(onClick = {
-                        clipboard.setText(AnnotatedString(bleLog))
-                    }) {
+                    TextButton(onClick = { clipboard.setText(AnnotatedString(bleLog)) }) {
                         Text("로그 복사", fontSize = 12.sp, color = LABEL_GRAY)
                     }
                     TextButton(onClick = { showManual = !showManual }) {
@@ -706,15 +982,12 @@ fun ConnectDialog(
     }
 }
 
-/** 스캔 목록의 기기 한 줄 */
 @Composable
 fun DeviceRow(device: BleDevice, onClick: () -> Unit) {
     Surface(
         color = CARD_BG,
         shape = RoundedCornerShape(10.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() }
+        modifier = Modifier.fillMaxWidth().clickable { onClick() }
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -750,107 +1023,7 @@ fun DeviceRow(device: BleDevice, onClick: () -> Unit) {
                     maxLines = 1
                 )
             }
-            Text(
-                "${device.rssi} dBm",
-                color = LABEL_GRAY,
-                fontSize = 11.sp,
-                maxLines = 1
-            )
+            Text("${device.rssi} dBm", color = LABEL_GRAY, fontSize = 11.sp, maxLines = 1)
         }
     }
-}
-
-/** 작은 숫자 + 단위 (전압/전류용) */
-@Composable
-fun SmallReading(
-    value: String,
-    unit: String,
-    accentColor: Color,
-    valueSize: Float,
-    unitSize: Float
-) {
-    Row(verticalAlignment = Alignment.Bottom) {
-        Text(
-            text = value,
-            color = accentColor,
-            fontSize = valueSize.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            softWrap = false
-        )
-        Text(
-            text = unit,
-            color = accentColor.copy(alpha = 0.7f),
-            fontSize = unitSize.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            modifier = Modifier.padding(start = 2.dp, bottom = (valueSize * 0.08f).dp)
-        )
-    }
-}
-
-/** 가로 막대 게이지 (너비는 modifier로 지정) */
-@Composable
-fun HorizontalBar(
-    fraction: Float,
-    color: Color,
-    thickness: Float,
-    modifier: Modifier = Modifier
-) {
-    val shape = RoundedCornerShape((thickness / 2f).dp)
-    Box(
-        modifier = modifier
-            .height(thickness.dp)
-            .clip(shape)
-            .background(TRACK)
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth(fraction.coerceIn(0f, 1f))
-                .fillMaxHeight()
-                .clip(shape)
-                .background(color)
-        )
-    }
-}
-
-/** 세로 막대 게이지 (높이는 modifier로 지정) */
-@Composable
-fun VerticalBar(
-    fraction: Float,
-    color: Color,
-    thickness: Float,
-    modifier: Modifier = Modifier
-) {
-    val shape = RoundedCornerShape((thickness / 2f).dp)
-    Box(
-        modifier = modifier
-            .width(thickness.dp)
-            .clip(shape)
-            .background(TRACK)
-    ) {
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .fillMaxHeight(fraction.coerceIn(0f, 1f))
-                .clip(shape)
-                .background(color)
-        )
-    }
-}
-
-/**
- * 게이지 사이 세로 구분선.
- * (Material3에도 VerticalDivider가 있어서 이름 충돌을 피하려고 GaugeDivider로 둠)
- */
-@Composable
-fun GaugeDivider() {
-    Box(
-        modifier = Modifier
-            .fillMaxHeight()
-            .width(1.dp)
-            .padding(vertical = 24.dp)
-            .background(Color(0xFF333333))
-    )
 }

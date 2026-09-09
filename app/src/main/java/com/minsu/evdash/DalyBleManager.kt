@@ -64,10 +64,15 @@ class DalyBleManager(
         private const val LOG_THROTTLE_MS = 500L
 
         /**
-         * 방전 전류를 양수로 볼지. JBD는 방전이 음수로 오는 게 기본이라 뒤집는다.
-         * 화면 부호가 반대로 나오면 이 값만 바꾸면 된다.
+         * 전류 부호 뒤집기.
+         *
+         * BMS는 "배터리 입장"에서 값을 보낸다. 전기가 빠져나가는 방전이 음수,
+         * 들어오는 충전이 양수다. 계기판에서는 반대여야 한다.
+         * 밟았을 때(방전) 양수, 회생제동/충전일 때 음수.
+         *
+         * 화면 부호가 반대로 나오면 이 값만 false 로 바꾸면 된다.
          */
-        private const val JBD_INVERT_CURRENT = true
+        private const val INVERT_CURRENT = true
 
         /** 표준(제조사 데이터 아님) 서비스 - 자동 탐색에서 제외 */
         private val STANDARD_SERVICES = setOf(
@@ -566,8 +571,7 @@ class DalyBleManager(
     private fun parseJbd(cmd: Int, d: List<Byte>) {
         if (cmd != 0x03 || d.size < 20) return
         val v = u16(d[0], d[1]) / 100f
-        var a = s16(d[2], d[3]) / 100f
-        if (JBD_INVERT_CURRENT) a = -a
+        val a = s16(d[2], d[3]) / 100f
         val s = (d[19].toInt() and 0xFF).toFloat()
         if (v <= 0f || v > 200f) return
         lockProtocol("JBD")
@@ -575,8 +579,11 @@ class DalyBleManager(
     }
 
     /** 값 해석 성공 - 화면에 반영하고 즉시 다음 요청을 앞당긴다 */
-    private fun onParsed(v: Float, a: Float, s: Float) {
+    private fun onParsed(v: Float, rawCurrent: Float, s: Float) {
         parsedCount++
+
+        // 프로토콜이 뭐든 부호는 여기 한 군데서만 뒤집는다
+        val a = if (INVERT_CURRENT) -rawCurrent else rawCurrent
 
         val now = SystemClock.elapsedRealtime()
         if (lastParseTime > 0L) {

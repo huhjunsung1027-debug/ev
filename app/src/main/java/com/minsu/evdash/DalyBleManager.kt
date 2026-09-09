@@ -104,9 +104,17 @@ class DalyBleManager(
                     0xDD.toByte(), 0xA5.toByte(), 0x03, 0x00,
                     0xFF.toByte(), 0xFD.toByte(), 0x77
                 ),
-                "Modbus" to byteArrayOf(
+                "JBD-cell" to byteArrayOf(
+                    0xDD.toByte(), 0xA5.toByte(), 0x04, 0x00,
+                    0xFF.toByte(), 0xFC.toByte(), 0x77
+                ),
+                "Modbus(D2)" to byteArrayOf(
                     0xD2.toByte(), 0x03, 0x00, 0x00, 0x00, 0x3E,
                     0xD7.toByte(), 0xB9.toByte()
+                ),
+                "Modbus(01)" to byteArrayOf(
+                    0x01, 0x03, 0x00, 0x00, 0x00, 0x20,
+                    0x44.toByte(), 0x12.toByte()
                 )
             )
         }
@@ -152,9 +160,20 @@ class DalyBleManager(
 
     private val foundDevices = linkedMapOf<String, BleDevice>()
 
-    private var notifyChar: BluetoothGattCharacteristic? = null
-    private var writeChar: BluetoothGattCharacteristic? = null
-    private var writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+    /** 알림을 받을 수 있는 characteristic 전부 (어디로 올지 몰라서 다 구독한다) */
+    private val notifyChars = mutableListOf<BluetoothGattCharacteristic>()
+
+    /** 요청을 쏠 수 있는 characteristic 전부 (어디에 쏴야 하는지 몰라서 다 찔러본다) */
+    private val writeChars = mutableListOf<BluetoothGattCharacteristic>()
+
+    /** 응답이 온 뒤 확정된 쓰기 대상 */
+    private var lockedWriteChar: BluetoothGattCharacteristic? = null
+
+    /** 방금 요청을 쏜 대상. 응답이 오면 이 놈으로 확정한다. */
+    private var pendingWriteChar: BluetoothGattCharacteristic? = null
+
+    /** 알림 구독을 하나씩 순서대로 걸기 위한 대기열 (GATT는 동시에 하나만 처리) */
+    private val cccdQueue = ArrayDeque<BluetoothGattCharacteristic>()
 
     private var serviceInfo = ""
     var lastServiceDump: String = ""
@@ -290,8 +309,10 @@ class DalyBleManager(
         stopPolling()
         rxBuffer.clear()
         rxLines.clear()
-        notifyChar = null
-        writeChar = null
+        notifyChars.clear()
+        writeChars.clear()
+        cccdQueue.clear()
+        lockedWriteChar = null
         detectedProtocol = null
         probeIndex = 0
         lastTx = ""
@@ -329,41 +350,42 @@ class DalyBleManager(
             lastServiceDump = buildDump(g)
             Log.d(TAG, "SERVICES:\n$lastServiceDump")
 
-            val target = g.services.firstOrNull { svc ->
-                !isStandardService(svc.uuid) &&
-                        findNotify(svc) != null && findWrite(svc) != null
+            notifyChars.clear()
+            writeChars.clear()
+
+            // 어느 서비스가 데이터용인지 미리 알 수 없다.
+            // 표준 서비스만 빼고 알림/쓰기 가능한 characteristic을 전부 모은다.
+            for (svc in g.services) {
+                if (isStandardService(svc.uuid)) continue
+                for (ch in svc.characteristics) {
+                    val p = ch.properties
+                    if (p and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                                BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+                    ) {
+                        notifyChars.add(ch)
+                    }
+                    if (p and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                    ) {
+                        writeChars.add(ch)
+                    }
+                }
             }
 
-            if (target == null) {
+            if (notifyChars.isEmpty() && writeChars.isEmpty()) {
                 onConnectionState(false)
-                onLog("통신용 서비스를 찾지 못했습니다.\n\n발견된 구조:\n$lastServiceDump")
+                onLog("통신용 characteristic이 없습니다.\n\n발견된 구조:\n$lastServiceDump")
                 return
             }
 
-            notifyChar = findNotify(target)
-            writeChar = findWrite(target)
-            writeType = if (writeChar!!.properties and
-                BluetoothGattCharacteristic.PROPERTY_WRITE != 0
-            ) {
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            } else {
-                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            }
+            serviceInfo = "알림 ${notifyChars.size}개 / 쓰기 ${writeChars.size}개 후보\n" +
+                    lastServiceDump
 
-            serviceInfo = "서비스 ${shortUuid(target.uuid)} / " +
-                    "알림 ${shortUuid(notifyChar!!.uuid)} / " +
-                    "쓰기 ${shortUuid(writeChar!!.uuid)}"
-
-            g.setCharacteristicNotification(notifyChar, true)
-            val cccd = notifyChar!!.getDescriptor(CCCD_UUID)
-            if (cccd != null) {
-                @Suppress("DEPRECATION")
-                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                @Suppress("DEPRECATION")
-                g.writeDescriptor(cccd)
-            } else {
-                beginCommunication(g)
-            }
+            // 데이터가 어느 채널로 올지 모르니 알림은 전부 구독한다.
+            // GATT는 한 번에 하나씩만 처리하므로 대기열로 순서대로 건다.
+            cccdQueue.clear()
+            cccdQueue.addAll(notifyChars)
+            enableNextNotification(g)
         }
 
         override fun onDescriptorWrite(
@@ -372,7 +394,7 @@ class DalyBleManager(
             status: Int
         ) {
             if (descriptor.uuid != CCCD_UUID) return
-            beginCommunication(g)
+            enableNextNotification(g)
         }
 
         @Suppress("DEPRECATION")
@@ -405,6 +427,36 @@ class DalyBleManager(
         updateStatusLog(false)
     }
 
+    /**
+     * 알림 구독을 하나씩 순서대로 건다.
+     * GATT는 요청을 한 번에 하나만 처리해서, 한꺼번에 걸면 뒤엣것이 조용히 씹힌다.
+     * 대기열이 비면 그때 통신을 시작한다.
+     */
+    @SuppressLint("MissingPermission")
+    private fun enableNextNotification(g: BluetoothGatt) {
+        val ch = cccdQueue.removeFirstOrNull()
+        if (ch == null) {
+            beginCommunication(g)
+            return
+        }
+        g.setCharacteristicNotification(ch, true)
+        val cccd = ch.getDescriptor(CCCD_UUID)
+        if (cccd == null) {
+            enableNextNotification(g)   // 이 놈은 CCCD가 없다 - 건너뜀
+            return
+        }
+        val value = if (ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        }
+        @Suppress("DEPRECATION")
+        cccd.value = value
+        @Suppress("DEPRECATION")
+        val ok = g.writeDescriptor(cccd)
+        if (!ok) enableNextNotification(g)   // 실패하면 다음 놈으로
+    }
+
     private fun beginCommunication(g: BluetoothGatt) {
         val device = g.device
         onConnectionState(true)
@@ -423,7 +475,6 @@ class DalyBleManager(
         lastLogUpdate = now
 
         val sb = StringBuilder()
-        sb.append(serviceInfo).append("\n\n")
         sb.append("프로토콜: ").append(detectedProtocol ?: "탐색 중...")
         if (updateHz > 0f) sb.append("   (%.1f Hz)".format(updateHz))
         sb.append("\n보낸 프레임: ").append(lastTx)
@@ -434,6 +485,8 @@ class DalyBleManager(
         } else {
             sb.append("\n\n최근 수신:\n").append(rxLines.joinToString("\n"))
         }
+        // 구조는 항상 붙여둔다. 안 붙으면 이걸 보고 진단해야 한다.
+        sb.append("\n\n").append(serviceInfo)
         onLog(sb.toString())
     }
 
@@ -441,18 +494,6 @@ class DalyBleManager(
 
     private fun isStandardService(uuid: UUID): Boolean =
         shortUuid(uuid).lowercase() in STANDARD_SERVICES
-
-    private fun findNotify(svc: BluetoothGattService): BluetoothGattCharacteristic? =
-        svc.characteristics.firstOrNull {
-            it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
-                    BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-        }
-
-    private fun findWrite(svc: BluetoothGattService): BluetoothGattCharacteristic? =
-        svc.characteristics.firstOrNull {
-            it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-        }
 
     private fun buildDump(g: BluetoothGatt): String {
         val sb = StringBuilder()
@@ -484,8 +525,8 @@ class DalyBleManager(
     private val requestRunnable = Runnable { sendRequest() }
 
     private fun startPolling() {
-        if (writeChar == null) {
-            onLog("쓰기 characteristic이 없습니다.")
+        if (writeChars.isEmpty()) {
+            onLog("쓰기 characteristic이 없습니다.\n일부 BMS는 요청 없이 알림만 보냅니다. 잠시 기다려보세요.")
             return
         }
         polling = true
@@ -509,21 +550,21 @@ class DalyBleManager(
     private fun sendRequest() {
         if (!polling) return
         val g = gatt ?: return
-        val wc = writeChar ?: return
+        if (writeChars.isEmpty()) return
 
         val found = detectedProtocol
-        var (name, frame) = if (found != null) {
-            PROBE_FRAMES.first { it.first == found }
-        } else {
-            // 아직 못 찾았으면 후보를 돌아가며 찔러본다
-            val f = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
-            probeIndex++
-            f
-        }
+        val wc: BluetoothGattCharacteristic
+        var frame: ByteArray
+        var name: String
 
-        // Daly는 온도가 별도 커맨드(0x92)라 가끔 한 번씩 섞어 보낸다.
-        // JBD는 기본 응답에 온도가 이미 들어있어서 필요 없다.
         if (found != null) {
+            // 확정됨 - 통하는 조합만 반복
+            wc = lockedWriteChar ?: writeChars[0]
+            val f = PROBE_FRAMES.first { it.first == found }
+            name = f.first
+            frame = f.second
+
+            // Daly는 온도가 별도 커맨드(0x92)라 가끔 한 번씩 섞어 보낸다.
             requestCounter++
             if (requestCounter % TEMP_EVERY_N == 0) {
                 DALY_TEMP_FRAMES[found]?.let {
@@ -531,17 +572,32 @@ class DalyBleManager(
                     name = "$found·온도"
                 }
             }
+        } else {
+            // 탐색 중 - (쓰기 대상 × 요청 프레임) 모든 조합을 돌아가며 찔러본다
+            val combos = writeChars.size * PROBE_FRAMES.size
+            val idx = probeIndex % combos
+            probeIndex++
+            wc = writeChars[idx / PROBE_FRAMES.size]
+            val f = PROBE_FRAMES[idx % PROBE_FRAMES.size]
+            name = f.first
+            frame = f.second
         }
 
-        lastTx = "$name  ${hex(frame)}"
-        wc.value = frame
-        wc.writeType = writeType
-        g.writeCharacteristic(wc)
-        Log.d(TAG, "TX($name): ${hex(frame)}")
+        val type = if (wc.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
 
+        lastTx = "$name \u2192 ${shortUuid(wc.uuid)}  ${hex(frame)}"
+        wc.value = frame
+        wc.writeType = type
+        g.writeCharacteristic(wc)
+        Log.d(TAG, "TX($name \u2192 ${shortUuid(wc.uuid)}): ${hex(frame)}")
+
+        pendingWriteChar = wc
         updateStatusLog(false)
 
-        // 응답이 안 오면 이 시점에 재시도 / 다음 후보로 넘어감
         scheduleNext(if (found != null) RESPONSE_TIMEOUT_MS else PROBE_INTERVAL_MS)
     }
 
@@ -663,6 +719,7 @@ class DalyBleManager(
     private fun lockProtocol(name: String) {
         if (detectedProtocol == null) {
             detectedProtocol = name
+            lockedWriteChar = pendingWriteChar   // 응답을 이끌어낸 그 채널로 고정
             Log.d(TAG, "프로토콜 확정: $name")
             updateStatusLog(true)
         }

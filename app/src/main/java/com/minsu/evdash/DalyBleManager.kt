@@ -6,6 +6,7 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import java.util.*
 
@@ -30,10 +31,9 @@ data class BleDevice(
  *  - UUID: Notify + Write 를 둘 다 가진 커스텀 서비스를 자동 선택
  *  - 프로토콜: 알려진 요청 프레임을 순서대로 찔러보고, 응답이 해석되는 놈으로 고정
  *
- * 지원 프로토콜
- *  1) Daly UART-over-BLE  (요청 A5 xx 90 08 ... / 응답 A5 01 90 08 ...)
- *  2) JBD(Xiaoxiang) Smart BMS (요청 DD A5 03 00 FF FD 77 / 응답 DD 03 00 len ... 77)
- *  3) Daly Modbus 계열은 응답 바이트만 화면에 덤프 (해석은 실측 후 추가)
+ * 갱신 속도:
+ *  고정 타이머로 1초마다 쏘는 게 아니라, 응답이 오는 즉시 다음 요청을 보낸다.
+ *  BMS가 답하는 만큼 최대한 빠르게 돈다 (보통 5~8Hz).
  */
 class DalyBleManager(
     private val context: Context,
@@ -50,8 +50,18 @@ class DalyBleManager(
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         private const val SCAN_TIMEOUT_MS = 12000L
-        private const val PROBE_INTERVAL_MS = 700L   // 프로토콜 탐색 중 전송 간격
-        private const val POLL_INTERVAL_MS = 1000L   // 확정 후 갱신 간격
+
+        /** 응답 받고 다음 요청까지 최소 간격 (ms). 너무 줄이면 BMS가 못 따라온다. */
+        private const val MIN_GAP_MS = 120L
+
+        /** 이 시간 안에 응답이 없으면 같은 요청을 다시 보낸다 (ms) */
+        private const val RESPONSE_TIMEOUT_MS = 1200L
+
+        /** 프로토콜 탐색 중 다음 후보로 넘어가는 간격 (ms) */
+        private const val PROBE_INTERVAL_MS = 700L
+
+        /** 진단 로그 갱신 최소 간격 (ms). 매 패킷마다 갱신하면 화면이 버벅인다. */
+        private const val LOG_THROTTLE_MS = 500L
 
         /**
          * 방전 전류를 양수로 볼지. JBD는 방전이 음수로 오는 게 기본이라 뒤집는다.
@@ -115,7 +125,6 @@ class DalyBleManager(
     private val adapter: BluetoothAdapter? = bluetoothManager.adapter
     private var gatt: BluetoothGatt? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var pollRunnable: Runnable? = null
 
     private var activeScanCallback: ScanCallback? = null
     private var scanTimeoutRunnable: Runnable? = null
@@ -125,18 +134,25 @@ class DalyBleManager(
 
     private var notifyChar: BluetoothGattCharacteristic? = null
     private var writeChar: BluetoothGattCharacteristic? = null
+    private var writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
     private var serviceInfo = ""
     var lastServiceDump: String = ""
         private set
 
-    // ── 프로토콜 탐색 상태 ──
+    // ── 프로토콜 탐색 / 통신 상태 ──
     private var detectedProtocol: String? = null   // null이면 아직 탐색 중
     private var probeIndex = 0
     private var lastTx = ""
     private val rxLines = mutableListOf<String>()
     private var rxTotal = 0
     private var parsedCount = 0
+    private var polling = false
+    private var lastLogUpdate = 0L
+
+    /** 실제 갱신 주기 측정용 */
+    private var lastParseTime = 0L
+    private var updateHz = 0f
 
     private val rxBuffer = mutableListOf<Byte>()
 
@@ -250,6 +266,7 @@ class DalyBleManager(
     }
 
     private fun resetSession() {
+        stopPolling()
         rxBuffer.clear()
         rxLines.clear()
         notifyChar = null
@@ -259,6 +276,9 @@ class DalyBleManager(
         lastTx = ""
         rxTotal = 0
         parsedCount = 0
+        lastParseTime = 0L
+        updateHz = 0f
+        lastLogUpdate = 0L
     }
 
     @SuppressLint("MissingPermission")
@@ -267,6 +287,9 @@ class DalyBleManager(
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 onLog("연결됨. 서비스 확인 중...")
+                // BLE 기본 연결 간격은 50ms 안팎이다. 이걸 안 낮추면
+                // 아무리 빨리 요청해도 그 이하로는 못 내려간다.
+                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 g.requestMtu(247)   // 긴 응답 프레임이 잘리지 않게
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 onLog("연결이 끊겼습니다. (status=$status)")
@@ -277,6 +300,7 @@ class DalyBleManager(
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            Log.d(TAG, "MTU = $mtu")
             g.discoverServices()
         }
 
@@ -291,14 +315,20 @@ class DalyBleManager(
 
             if (target == null) {
                 onConnectionState(false)
-                onLog(
-                    "통신용 서비스를 찾지 못했습니다.\n\n발견된 구조:\n$lastServiceDump"
-                )
+                onLog("통신용 서비스를 찾지 못했습니다.\n\n발견된 구조:\n$lastServiceDump")
                 return
             }
 
             notifyChar = findNotify(target)
             writeChar = findWrite(target)
+            writeType = if (writeChar!!.properties and
+                BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+            ) {
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            } else {
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            }
+
             serviceInfo = "서비스 ${shortUuid(target.uuid)} / " +
                     "알림 ${shortUuid(notifyChar!!.uuid)} / " +
                     "쓰기 ${shortUuid(writeChar!!.uuid)}"
@@ -351,32 +381,37 @@ class DalyBleManager(
         rxBuffer.addAll(bytes.toList())
         if (rxBuffer.size > 512) rxBuffer.clear()
         tryParseBuffer()
-        updateStatusLog()
+        updateStatusLog(false)
     }
 
-    @SuppressLint("MissingPermission")
     private fun beginCommunication(g: BluetoothGatt) {
         val device = g.device
         onConnectionState(true)
         onDeviceConnected(device.name ?: "BMS", device.address ?: "")
-        updateStatusLog()
-        startPolling(g)
+        updateStatusLog(true)
+        startPolling()
     }
 
-    /** 연결 창에 뿌릴 진단 문자열 */
-    private fun updateStatusLog() {
+    /**
+     * 연결 창에 뿌릴 진단 문자열.
+     * 매 패킷마다 갱신하면 화면 전체가 다시 그려져서 오히려 버벅인다.
+     */
+    private fun updateStatusLog(force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastLogUpdate < LOG_THROTTLE_MS) return
+        lastLogUpdate = now
+
         val sb = StringBuilder()
         sb.append(serviceInfo).append("\n\n")
-        sb.append("프로토콜: ")
-        sb.append(detectedProtocol ?: "탐색 중...")
+        sb.append("프로토콜: ").append(detectedProtocol ?: "탐색 중...")
+        if (updateHz > 0f) sb.append("   (%.1f Hz)".format(updateHz))
         sb.append("\n보낸 프레임: ").append(lastTx)
         sb.append("\n받은 바이트: ").append(rxTotal)
         sb.append(" / 해석 성공: ").append(parsedCount)
         if (rxLines.isEmpty()) {
             sb.append("\n\n수신 데이터 없음.\nBMS 순정 앱이 켜져 있으면 완전히 종료하세요.")
         } else {
-            sb.append("\n\n최근 수신:\n")
-            sb.append(rxLines.joinToString("\n"))
+            sb.append("\n\n최근 수신:\n").append(rxLines.joinToString("\n"))
         }
         onLog(sb.toString())
     }
@@ -421,51 +456,60 @@ class DalyBleManager(
 
     // ─────────────────────────── 송신 ───────────────────────────
 
-    @SuppressLint("MissingPermission")
-    private fun startPolling(g: BluetoothGatt) {
-        stopPolling()
-        val wc = writeChar ?: run {
+    /**
+     * 고정 타이머가 아니라 요청-응답 방식.
+     * 보낼 때 타임아웃을 걸어두고, 응답이 먼저 오면 그 즉시 다음 요청을 앞당긴다.
+     */
+    private val requestRunnable = Runnable { sendRequest() }
+
+    private fun startPolling() {
+        if (writeChar == null) {
             onLog("쓰기 characteristic이 없습니다.")
             return
         }
-        val type = if (wc.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        } else {
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        }
-
-        pollRunnable = object : Runnable {
-            @Suppress("DEPRECATION")
-            override fun run() {
-                val found = detectedProtocol
-                val (name, frame) = if (found != null) {
-                    PROBE_FRAMES.first { it.first == found }
-                } else {
-                    // 아직 못 찾았으면 후보를 돌아가며 찔러본다
-                    val f = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
-                    probeIndex++
-                    f
-                }
-
-                lastTx = "$name  ${hex(frame)}"
-                wc.value = frame
-                wc.writeType = type
-                g.writeCharacteristic(wc)
-                Log.d(TAG, "TX($name): ${hex(frame)}")
-
-                updateStatusLog()
-                handler.postDelayed(
-                    this,
-                    if (found != null) POLL_INTERVAL_MS else PROBE_INTERVAL_MS
-                )
-            }
-        }
-        handler.post(pollRunnable!!)
+        polling = true
+        handler.removeCallbacks(requestRunnable)
+        handler.post(requestRunnable)
     }
 
     private fun stopPolling() {
-        pollRunnable?.let { handler.removeCallbacks(it) }
-        pollRunnable = null
+        polling = false
+        handler.removeCallbacks(requestRunnable)
+    }
+
+    private fun scheduleNext(delayMs: Long) {
+        if (!polling) return
+        handler.removeCallbacks(requestRunnable)
+        handler.postDelayed(requestRunnable, delayMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    private fun sendRequest() {
+        if (!polling) return
+        val g = gatt ?: return
+        val wc = writeChar ?: return
+
+        val found = detectedProtocol
+        val (name, frame) = if (found != null) {
+            PROBE_FRAMES.first { it.first == found }
+        } else {
+            // 아직 못 찾았으면 후보를 돌아가며 찔러본다
+            val f = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
+            probeIndex++
+            f
+        }
+
+        lastTx = "$name  ${hex(frame)}"
+        wc.value = frame
+        wc.writeType = writeType
+        g.writeCharacteristic(wc)
+        Log.d(TAG, "TX($name): ${hex(frame)}")
+
+        updateStatusLog(false)
+
+        // 응답이 안 오면 이 시점에 재시도 / 다음 후보로 넘어감
+        scheduleNext(if (found != null) RESPONSE_TIMEOUT_MS else PROBE_INTERVAL_MS)
     }
 
     // ─────────────────────────── 파싱 ───────────────────────────
@@ -512,8 +556,7 @@ class DalyBleManager(
         val s = u16(frame[10], frame[11]) / 10f
         if (v <= 0f || v > 200f) return    // 말도 안 되는 값이면 버림
         lockProtocol(if (frame[1].toInt() and 0xFF == 0x01) "Daly(40)" else "Daly(80)")
-        parsedCount++
-        onData(v, a, s)
+        onParsed(v, a, s)
     }
 
     /**
@@ -528,14 +571,34 @@ class DalyBleManager(
         val s = (d[19].toInt() and 0xFF).toFloat()
         if (v <= 0f || v > 200f) return
         lockProtocol("JBD")
+        onParsed(v, a, s)
+    }
+
+    /** 값 해석 성공 - 화면에 반영하고 즉시 다음 요청을 앞당긴다 */
+    private fun onParsed(v: Float, a: Float, s: Float) {
         parsedCount++
+
+        val now = SystemClock.elapsedRealtime()
+        if (lastParseTime > 0L) {
+            val dt = (now - lastParseTime) / 1000f
+            if (dt > 0.001f) {
+                val hz = 1f / dt
+                updateHz = if (updateHz == 0f) hz else updateHz * 0.8f + hz * 0.2f
+            }
+        }
+        lastParseTime = now
+
         onData(v, a, s)
+
+        // 여기가 핵심. 타임아웃까지 기다리지 않고 바로 다음 요청을 쏜다.
+        if (detectedProtocol != null) scheduleNext(MIN_GAP_MS)
     }
 
     private fun lockProtocol(name: String) {
         if (detectedProtocol == null) {
             detectedProtocol = name
             Log.d(TAG, "프로토콜 확정: $name")
+            updateStatusLog(true)
         }
     }
 

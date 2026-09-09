@@ -38,6 +38,7 @@ data class BleDevice(
 class DalyBleManager(
     private val context: Context,
     private val onData: (voltage: Float, current: Float, soc: Float) -> Unit,
+    private val onTemperature: (tempC: Float) -> Unit = {},
     private val onConnectionState: (connected: Boolean) -> Unit,
     private val onLog: (String) -> Unit,
     private val onScanResults: (List<BleDevice>) -> Unit = {},
@@ -110,6 +111,20 @@ class DalyBleManager(
             )
         }
 
+        /**
+         * Daly 온도 조회 프레임 (커맨드 0x92).
+         * 온도는 천천히 변하므로 매번이 아니라 가끔만 섞어 보낸다.
+         */
+        private val DALY_TEMP_FRAMES: Map<String, ByteArray> by lazy {
+            mapOf(
+                "Daly(40)" to dalyFrame(0x40, 0x92),
+                "Daly(80)" to dalyFrame(0x80, 0x92)
+            )
+        }
+
+        /** 이 횟수마다 한 번씩 온도를 물어본다 */
+        private const val TEMP_EVERY_N = 5
+
         /** 0000XXXX-0000-1000-8000-00805f9b34fb 형태면 4자리로 줄여서 표시 */
         fun shortUuid(uuid: UUID): String {
             val s = uuid.toString().lowercase()
@@ -154,6 +169,7 @@ class DalyBleManager(
     private var parsedCount = 0
     private var polling = false
     private var lastLogUpdate = 0L
+    private var requestCounter = 0
 
     /** 실제 갱신 주기 측정용 */
     private var lastParseTime = 0L
@@ -496,13 +512,25 @@ class DalyBleManager(
         val wc = writeChar ?: return
 
         val found = detectedProtocol
-        val (name, frame) = if (found != null) {
+        var (name, frame) = if (found != null) {
             PROBE_FRAMES.first { it.first == found }
         } else {
             // 아직 못 찾았으면 후보를 돌아가며 찔러본다
             val f = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
             probeIndex++
             f
+        }
+
+        // Daly는 온도가 별도 커맨드(0x92)라 가끔 한 번씩 섞어 보낸다.
+        // JBD는 기본 응답에 온도가 이미 들어있어서 필요 없다.
+        if (found != null) {
+            requestCounter++
+            if (requestCounter % TEMP_EVERY_N == 0) {
+                DALY_TEMP_FRAMES[found]?.let {
+                    frame = it
+                    name = "$found·온도"
+                }
+            }
         }
 
         lastTx = "$name  ${hex(frame)}"
@@ -552,21 +580,38 @@ class DalyBleManager(
         }
     }
 
-    /** Daly 0x90 응답: 전압 / (예약) / 전류(+30000) / SOC, 각 2바이트 0.1단위 */
+    /**
+     * Daly 응답 처리.
+     *  0x90 - 전압 / (예약) / 전류(+30000) / SOC, 각 2바이트 0.1단위
+     *  0x92 - 최고온도 / 최고온도셀 / 최저온도 / 최저온도셀, 각 1바이트 (+40 오프셋)
+     */
     private fun parseDaly(frame: List<Byte>) {
-        val cmd = frame[2].toInt() and 0xFF
-        if (cmd != 0x90) return
-        val v = u16(frame[4], frame[5]) / 10f
-        val a = (u16(frame[8], frame[9]) - 30000) / 10f
-        val s = u16(frame[10], frame[11]) / 10f
-        if (v <= 0f || v > 200f) return    // 말도 안 되는 값이면 버림
-        lockProtocol(if (frame[1].toInt() and 0xFF == 0x01) "Daly(40)" else "Daly(80)")
-        onParsed(v, a, s)
+        when (frame[2].toInt() and 0xFF) {
+
+            0x90 -> {
+                val v = u16(frame[4], frame[5]) / 10f
+                val a = (u16(frame[8], frame[9]) - 30000) / 10f
+                val s = u16(frame[10], frame[11]) / 10f
+                if (v <= 0f || v > 200f) return    // 말도 안 되는 값이면 버림
+                lockProtocol(if (frame[1].toInt() and 0xFF == 0x01) "Daly(40)" else "Daly(80)")
+                onParsed(v, a, s)
+            }
+
+            0x92 -> {
+                val maxT = (frame[4].toInt() and 0xFF) - 40
+                if (maxT in -40..150) {
+                    onTemperature(maxT.toFloat())
+                    // 온도 응답도 하나의 왕복이므로 바로 다음 요청을 앞당긴다
+                    if (detectedProtocol != null) scheduleNext(MIN_GAP_MS)
+                }
+            }
+        }
     }
 
     /**
      * JBD 0x03(기본정보) 응답.
-     *  0-1 총전압(10mV)  2-3 전류(10mA, 방전 음수)  19 SOC(%)
+     *  0-1 총전압(10mV)  2-3 전류(10mA)  19 SOC(%)
+     *  22 NTC 개수  23~ NTC 값 2바이트씩 (0.1K 단위)
      */
     private fun parseJbd(cmd: Int, d: List<Byte>) {
         if (cmd != 0x03 || d.size < 20) return
@@ -576,6 +621,20 @@ class DalyBleManager(
         if (v <= 0f || v > 200f) return
         lockProtocol("JBD")
         onParsed(v, a, s)
+
+        // 온도 센서는 여러 개일 수 있다. 가장 뜨거운 놈을 쓴다.
+        val ntcCount = if (d.size > 22) d[22].toInt() and 0xFF else 0
+        if (ntcCount in 1..8 && d.size >= 23 + ntcCount * 2) {
+            var maxKelvin = 0
+            for (i in 0 until ntcCount) {
+                val k = u16(d[23 + i * 2], d[24 + i * 2])
+                if (k > maxKelvin) maxKelvin = k
+            }
+            if (maxKelvin > 0) {
+                val c = (maxKelvin - 2731) / 10f   // 0.1K → ℃
+                if (c > -40f && c < 150f) onTemperature(c)
+            }
+        }
     }
 
     /** 값 해석 성공 - 화면에 반영하고 즉시 다음 요청을 앞당긴다 */

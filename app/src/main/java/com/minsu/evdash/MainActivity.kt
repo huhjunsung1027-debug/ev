@@ -7,7 +7,13 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -22,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -49,6 +56,19 @@ private const val POWER_GAUGE_MAX = 12000f
 private const val PWR_GREEN_MAX = 6000f
 private const val PWR_YELLOW_MAX = 8000f
 private const val PWR_ORANGE_MAX = 9500f
+
+/** 이보다 큰 음수 전류가 흐르면 충전/회생제동으로 본다 (A). 노이즈로 깜빡이지 않게. */
+private const val CHARGING_THRESHOLD_A = 0.5f
+
+/**
+ * 배터리 온도 경계(℃).
+ * 리튬이온은 방전 0~60℃, 충전 0~45℃가 일반적인 사용 범위다.
+ * 60℃ 넘어가면 셀 수명이 급격히 깎이고 그 위로는 위험 구간이다.
+ * 레이스 중 팩 온도는 보통 25~40℃, 45 넘어가면 식혀야 한다.
+ */
+private const val TEMP_WARN_C = 45f    // 주의 (노랑)
+private const val TEMP_ALERT_C = 55f   // 경보 (빨강)
+private const val TEMP_COLD_C = 0f     // 저온 주의 - 이 아래선 충전 금지
 
 private val GREEN = Color(0xFF4CD964)
 private val YELLOW = Color(0xFFFFD60A)
@@ -95,6 +115,22 @@ fun powerColorFor(watt: Float): Color = when {
     else -> RED
 }
 
+/** 배터리 온도 색상 */
+fun tempColorFor(c: Float): Color = when {
+    c >= TEMP_ALERT_C -> RED
+    c >= TEMP_WARN_C -> YELLOW
+    c < TEMP_COLD_C -> YELLOW      // 영하에서 충전하면 셀이 상한다
+    else -> GREEN
+}
+
+/** 온도 상태 문구. 정상이면 빈 문자열 */
+fun tempLabelFor(c: Float): String = when {
+    c >= TEMP_ALERT_C -> "경보"
+    c >= TEMP_WARN_C -> "주의"
+    c < TEMP_COLD_C -> "저온"
+    else -> ""
+}
+
 /** 배터리 잔량 색상 */
 fun batteryColorFor(pct: Float): Color = when {
     pct > 50f -> GREEN
@@ -112,6 +148,7 @@ class MainActivity : ComponentActivity() {
     private var voltage by mutableStateOf(0f)
     private var current by mutableStateOf(0f)
     private var soc by mutableStateOf(0f)
+    private var tempC by mutableStateOf(Float.NaN)   // NaN = 아직 못 받음
     private var speedKmh by mutableStateOf(0f)
     private var bleConnected by mutableStateOf(false)
     private var bleLog by mutableStateOf("연결 버튼을 눌러 BMS를 찾으세요.")
@@ -148,6 +185,7 @@ class MainActivity : ComponentActivity() {
         bleManager = DalyBleManager(
             context = this,
             onData = { v, c, s -> voltage = v; current = c; soc = s },
+            onTemperature = { t -> tempC = t },
             onConnectionState = { connected ->
                 bleConnected = connected
                 if (!connected) connectedName = ""
@@ -157,7 +195,6 @@ class MainActivity : ComponentActivity() {
             onScanningChanged = { s -> isScanning = s },
             onDeviceConnected = { name, address ->
                 connectedName = name
-                // 다음에 앱 켜면 자동으로 붙게 기억해둔다
                 prefs.edit().putString("last_address", address)
                     .putString("last_name", name).apply()
             }
@@ -169,6 +206,7 @@ class MainActivity : ComponentActivity() {
                 voltage = voltage,
                 current = current,
                 soc = soc,
+                tempC = tempC,
                 speedKmh = speedKmh,
                 bleConnected = bleConnected,
                 bleLog = bleLog,
@@ -221,6 +259,7 @@ fun DashboardScreen(
     voltage: Float,
     current: Float,
     soc: Float,
+    tempC: Float,
     speedKmh: Float,
     bleConnected: Boolean,
     bleLog: String,
@@ -243,9 +282,27 @@ fun DashboardScreen(
     val batteryPct = voltageToPercent(voltage)
     val batteryAccent = batteryColorFor(batteryPct)
 
+    // 전류가 음수 = 배터리로 전기가 들어오는 중 = 충전 / 회생제동
+    val isCharging = current < -CHARGING_THRESHOLD_A
+
+    // 충전 중엔 구간 색상을 무시하고 초록 고정. 숫자는 마이너스로 표시된다.
+    val powerDisplayColor = if (isCharging) GREEN else powerAccent
+
     // 게이지가 뚝뚝 끊기지 않게 부드럽게 이동
     val animBattery by animateFloatAsState(targetValue = batteryPct, label = "battery")
     val animPower by animateFloatAsState(targetValue = powerAbs, label = "power")
+
+    // 충전 중 번개 깜빡임
+    val boltPulse = rememberInfiniteTransition(label = "bolt")
+    val boltAlpha by boltPulse.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(700),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "boltAlpha"
+    )
 
     BoxWithConstraints(
         modifier = Modifier
@@ -276,13 +333,24 @@ fun DashboardScreen(
                 verticalArrangement = Arrangement.Center
             ) {
                 Text(
-                    text = "배터리",
-                    color = LABEL_GRAY,
+                    text = if (isCharging) "충전 중" else "배터리",
+                    color = if (isCharging) YELLOW else LABEL_GRAY,
                     fontSize = labelSize.sp,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1
                 )
+
                 Row(verticalAlignment = Alignment.Bottom) {
+                    if (isCharging) {
+                        BoltIcon(
+                            sizeDp = pctSize * 0.45f,
+                            color = YELLOW.copy(alpha = boltAlpha),
+                            modifier = Modifier.padding(
+                                end = 4.dp,
+                                bottom = (pctSize * 0.14f).dp
+                            )
+                        )
+                    }
                     Text(
                         text = "%.0f".format(batteryPct),
                         color = batteryAccent,
@@ -308,7 +376,7 @@ fun DashboardScreen(
 
                 HorizontalBar(
                     fraction = animBattery / 100f,
-                    color = batteryAccent,
+                    color = if (isCharging) YELLOW else batteryAccent,
                     thickness = barH,
                     modifier = Modifier.fillMaxWidth(0.88f)
                 )
@@ -321,7 +389,53 @@ fun DashboardScreen(
                 ) {
                     SmallReading("%.1f".format(voltage), "V", GREEN, smallSize, unitSize * 0.8f)
                     Spacer(modifier = Modifier.width((h * 0.045f).dp))
-                    SmallReading("%.1f".format(current), "A", ORANGE, smallSize, unitSize * 0.8f)
+                    SmallReading(
+                        "%.1f".format(current), "A",
+                        if (isCharging) YELLOW else ORANGE,
+                        smallSize, unitSize * 0.8f
+                    )
+                }
+
+                Spacer(modifier = Modifier.height((h * 0.028f).dp))
+
+                // 배터리 온도
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        text = "온도",
+                        color = LABEL_GRAY,
+                        fontSize = (unitSize * 0.85f).sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        modifier = Modifier.padding(
+                            end = 6.dp,
+                            bottom = (smallSize * 0.10f).dp
+                        )
+                    )
+                    if (tempC.isNaN()) {
+                        SmallReading("--", "\u2103", LABEL_GRAY, smallSize, unitSize * 0.8f)
+                    } else {
+                        SmallReading(
+                            "%.0f".format(tempC), "\u2103",
+                            tempColorFor(tempC), smallSize, unitSize * 0.8f
+                        )
+                        val warn = tempLabelFor(tempC)
+                        if (warn.isNotEmpty()) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                color = tempColorFor(tempC),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.padding(bottom = (smallSize * 0.10f).dp)
+                            ) {
+                                Text(
+                                    warn,
+                                    color = Color.Black,
+                                    fontSize = (unitSize * 0.75f).sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -381,7 +495,7 @@ fun DashboardScreen(
                     )
                     Text(
                         text = "%.0f".format(power),
-                        color = powerAccent,
+                        color = powerDisplayColor,
                         fontSize = powerSize.sp,
                         lineHeight = (powerSize * 1.15f).sp,
                         fontWeight = FontWeight.Bold,
@@ -390,7 +504,7 @@ fun DashboardScreen(
                     )
                     Text(
                         text = "W",
-                        color = powerAccent.copy(alpha = 0.75f),
+                        color = powerDisplayColor.copy(alpha = 0.75f),
                         fontSize = unitSize.sp,
                         fontWeight = FontWeight.Medium,
                         maxLines = 1
@@ -401,7 +515,7 @@ fun DashboardScreen(
 
                 VerticalBar(
                     fraction = animPower / POWER_GAUGE_MAX,
-                    color = powerAccent,
+                    color = powerDisplayColor,
                     thickness = barW,
                     modifier = Modifier.fillMaxHeight(0.62f)
                 )
@@ -448,6 +562,29 @@ fun DashboardScreen(
             onConnectAddress = { addr -> onConnectByAddress(addr); showConnectDialog = false },
             onForgetDevice = onForgetDevice
         )
+    }
+}
+
+/** 충전 표시용 번개 아이콘. 외부 아이콘 라이브러리 없이 직접 그린다. */
+@Composable
+fun BoltIcon(
+    sizeDp: Float,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier.size(width = (sizeDp * 0.62f).dp, height = sizeDp.dp)) {
+        val w = size.width
+        val hh = size.height
+        val path = Path().apply {
+            moveTo(w * 0.62f, 0f)
+            lineTo(w * 0.08f, hh * 0.58f)
+            lineTo(w * 0.45f, hh * 0.58f)
+            lineTo(w * 0.34f, hh)
+            lineTo(w * 0.94f, hh * 0.40f)
+            lineTo(w * 0.55f, hh * 0.40f)
+            close()
+        }
+        drawPath(path, color)
     }
 }
 

@@ -172,8 +172,12 @@ class DalyBleManager(
     /** 방금 요청을 쏜 대상. 응답이 오면 이 놈으로 확정한다. */
     private var pendingWriteChar: BluetoothGattCharacteristic? = null
 
-    /** 알림 구독을 하나씩 순서대로 걸기 위한 대기열 (GATT는 동시에 하나만 처리) */
-    private val cccdQueue = ArrayDeque<BluetoothGattCharacteristic>()
+    /**
+     * 알림 구독을 하나씩 순서대로 걸기 위한 대기열 (GATT는 동시에 하나만 처리).
+     * ArrayDeque를 쓰면 이 파일의 `import java.util.*` 때문에 java.util 쪽이 잡혀서
+     * kotlin의 removeFirstOrNull()을 못 쓴다. 그냥 리스트로 간다.
+     */
+    private val cccdQueue = mutableListOf<BluetoothGattCharacteristic>()
 
     private var serviceInfo = ""
     var lastServiceDump: String = ""
@@ -434,11 +438,11 @@ class DalyBleManager(
      */
     @SuppressLint("MissingPermission")
     private fun enableNextNotification(g: BluetoothGatt) {
-        val ch = cccdQueue.removeFirstOrNull()
-        if (ch == null) {
+        if (cccdQueue.isEmpty()) {
             beginCommunication(g)
             return
         }
+        val ch = cccdQueue.removeAt(0)
         g.setCharacteristicNotification(ch, true)
         val cccd = ch.getDescriptor(CCCD_UUID)
         if (cccd == null) {

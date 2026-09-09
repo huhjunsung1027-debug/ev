@@ -59,7 +59,13 @@ class DalyBleManager(
         private const val RESPONSE_TIMEOUT_MS = 1200L
 
         /** 프로토콜 탐색 중 다음 후보로 넘어가는 간격 (ms) */
-        private const val PROBE_INTERVAL_MS = 700L
+        private const val PROBE_INTERVAL_MS = 450L
+
+        /**
+         * 조합을 한 바퀴 다 돌았는데 한 바이트도 못 받았을 때 쉬는 시간.
+         * 요청 없이 알아서 데이터를 흘리는 BMS도 있어서, 잠깐 입을 다물고 들어본다.
+         */
+        private const val PASSIVE_LISTEN_MS = 5000L
 
         /** 진단 로그 갱신 최소 간격 (ms). 매 패킷마다 갱신하면 화면이 버벅인다. */
         private const val LOG_THROTTLE_MS = 500L
@@ -95,6 +101,22 @@ class DalyBleManager(
             return body + (sum and 0xFF).toByte()
         }
 
+        /**
+         * JK BMS(Jikong) 요청 프레임.
+         * AA 55 90 EB [커맨드] 00 ... (총 20바이트, 마지막은 앞 19바이트 합의 하위 1바이트)
+         */
+        private fun jkFrame(cmd: Int): ByteArray {
+            val f = ByteArray(20)
+            f[0] = 0xAA.toByte(); f[1] = 0x55.toByte()
+            f[2] = 0x90.toByte(); f[3] = 0xEB.toByte()
+            f[4] = cmd.toByte()
+            // f[5..18] 은 0x00
+            var sum = 0
+            for (i in 0..18) sum += f[i].toInt() and 0xFF
+            f[19] = (sum and 0xFF).toByte()
+            return f
+        }
+
         /** 찔러볼 요청 프레임 목록 (이름, 바이트) */
         private val PROBE_FRAMES: List<Pair<String, ByteArray>> by lazy {
             listOf(
@@ -115,7 +137,10 @@ class DalyBleManager(
                 "Modbus(01)" to byteArrayOf(
                     0x01, 0x03, 0x00, 0x00, 0x00, 0x20,
                     0x44.toByte(), 0x12.toByte()
-                )
+                ),
+                "JK-cell" to jkFrame(0x96),      // 셀 정보
+                "JK-info" to jkFrame(0x97),      // 기기 정보
+                "JK-set" to jkFrame(0x95)        // 설정 (일부 펌웨어는 이걸로 스트림 시작)
             )
         }
 
@@ -193,6 +218,10 @@ class DalyBleManager(
     private var polling = false
     private var lastLogUpdate = 0L
     private var requestCounter = 0
+    private var sweepJustFinished = false
+    private var txTried = 0        // 쓰기 시도 횟수
+    private var txAccepted = 0     // 안드로이드 스택이 받아준 횟수
+    private var txConfirmed = 0    // BMS까지 전달 확인된 횟수
 
     /** 실제 갱신 주기 측정용 */
     private var lastParseTime = 0L
@@ -324,6 +353,10 @@ class DalyBleManager(
         parsedCount = 0
         lastParseTime = 0L
         updateHz = 0f
+        sweepJustFinished = false
+        txTried = 0
+        txAccepted = 0
+        txConfirmed = 0
         lastLogUpdate = 0L
     }
 
@@ -401,6 +434,15 @@ class DalyBleManager(
             enableNextNotification(g)
         }
 
+        override fun onCharacteristicWrite(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) txConfirmed++
+            Log.d(TAG, "TX 완료 status=$status")
+        }
+
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
@@ -426,7 +468,7 @@ class DalyBleManager(
         while (rxLines.size > 5) rxLines.removeAt(0)
 
         rxBuffer.addAll(bytes.toList())
-        if (rxBuffer.size > 512) rxBuffer.clear()
+        if (rxBuffer.size > 1024) rxBuffer.clear()
         tryParseBuffer()
         updateStatusLog(false)
     }
@@ -482,6 +524,8 @@ class DalyBleManager(
         sb.append("프로토콜: ").append(detectedProtocol ?: "탐색 중...")
         if (updateHz > 0f) sb.append("   (%.1f Hz)".format(updateHz))
         sb.append("\n보낸 프레임: ").append(lastTx)
+        sb.append("\n쓰기 시도/수락/완료: ")
+            .append(txTried).append(" / ").append(txAccepted).append(" / ").append(txConfirmed)
         sb.append("\n받은 바이트: ").append(rxTotal)
         sb.append(" / 해석 성공: ").append(parsedCount)
         if (rxLines.isEmpty()) {
@@ -581,6 +625,7 @@ class DalyBleManager(
             val combos = writeChars.size * PROBE_FRAMES.size
             val idx = probeIndex % combos
             probeIndex++
+            sweepJustFinished = (probeIndex % combos == 0)
             wc = writeChars[idx / PROBE_FRAMES.size]
             val f = PROBE_FRAMES[idx % PROBE_FRAMES.size]
             name = f.first
@@ -596,13 +641,22 @@ class DalyBleManager(
         lastTx = "$name \u2192 ${shortUuid(wc.uuid)}  ${hex(frame)}"
         wc.value = frame
         wc.writeType = type
-        g.writeCharacteristic(wc)
-        Log.d(TAG, "TX($name \u2192 ${shortUuid(wc.uuid)}): ${hex(frame)}")
+        txTried++
+        // 반환값을 버리면 스택이 거절해도 모른다. 이전 GATT 작업이 안 끝났으면 false가 온다.
+        val accepted = g.writeCharacteristic(wc)
+        if (accepted) txAccepted++
+        Log.d(TAG, "TX($name \u2192 ${shortUuid(wc.uuid)}) accepted=$accepted: ${hex(frame)}")
 
         pendingWriteChar = wc
         updateStatusLog(false)
 
-        scheduleNext(if (found != null) RESPONSE_TIMEOUT_MS else PROBE_INTERVAL_MS)
+        val delay = when {
+            found != null -> RESPONSE_TIMEOUT_MS
+            // 한 바퀴 끝 + 아직 한 바이트도 못 받음 → 조용히 듣는 구간
+            sweepJustFinished && rxTotal == 0 -> PASSIVE_LISTEN_MS
+            else -> PROBE_INTERVAL_MS
+        }
+        scheduleNext(delay)
     }
 
     // ─────────────────────────── 파싱 ───────────────────────────
@@ -625,6 +679,20 @@ class DalyBleManager(
                     } else {
                         rxBuffer.removeAt(0)
                     }
+                }
+
+                // ── JK BMS: 55 AA EB 90 [type] ... 총 300바이트, 리틀엔디안
+                0x55 -> {
+                    if ((rxBuffer[1].toInt() and 0xFF) != 0xAA ||
+                        (rxBuffer[2].toInt() and 0xFF) != 0xEB ||
+                        (rxBuffer[3].toInt() and 0xFF) != 0x90
+                    ) {
+                        rxBuffer.removeAt(0); continue
+                    }
+                    if (rxBuffer.size < 300) return
+                    val f = rxBuffer.subList(0, 300).toList()
+                    parseJk(f)
+                    rxBuffer.subList(0, 300).clear()
                 }
 
                 // ── Daly: A5 [addr] [cmd] 08 <8 bytes> [cksum] = 13바이트
@@ -718,6 +786,47 @@ class DalyBleManager(
 
         // 여기가 핵심. 타임아웃까지 기다리지 않고 바로 다음 요청을 쏜다.
         if (detectedProtocol != null) scheduleNext(MIN_GAP_MS)
+    }
+
+    /**
+     * JK BMS 셀정보(0x02) 응답 해석. 전부 리틀엔디안.
+     *  118: 총전압 uint32 (mV)   126: 전류 int32 (mA)
+     *  130: 온도센서1 int16 (0.1℃)   141: SOC uint8 (%)
+     *
+     * 오프셋이 펌웨어마다 다를 수 있어서 값이 상식 밖이면 확정하지 않는다.
+     * 그래야 잘못 잠기지 않고 원본 바이트가 화면에 계속 남는다.
+     */
+    private fun parseJk(f: List<Byte>) {
+        if ((f[4].toInt() and 0xFF) != 0x02) return   // 셀 정보 프레임만 사용
+
+        val v = u32le(f, 118) / 1000f
+        val a = s32le(f, 126) / 1000f
+        val soc = f[141].toInt() and 0xFF
+        val t1 = s16le(f, 130) / 10f
+
+        if (v <= 0f || v > 200f) return
+        if (soc > 100) return
+        if (a < -1000f || a > 1000f) return
+
+        lockProtocol("JK-cell")
+        onParsed(v, a, soc.toFloat())
+        if (t1 > -40f && t1 < 150f) onTemperature(t1)
+    }
+
+    private fun u32le(f: List<Byte>, i: Int): Long =
+        (f[i].toLong() and 0xFF) or
+                ((f[i + 1].toLong() and 0xFF) shl 8) or
+                ((f[i + 2].toLong() and 0xFF) shl 16) or
+                ((f[i + 3].toLong() and 0xFF) shl 24)
+
+    private fun s32le(f: List<Byte>, i: Int): Int {
+        val v = u32le(f, i)
+        return if (v > 2147483647L) (v - 4294967296L).toInt() else v.toInt()
+    }
+
+    private fun s16le(f: List<Byte>, i: Int): Int {
+        val v = (f[i].toInt() and 0xFF) or ((f[i + 1].toInt() and 0xFF) shl 8)
+        return if (v > 32767) v - 65536 else v
     }
 
     private fun lockProtocol(name: String) {

@@ -1,5 +1,6 @@
 package com.minsu.evdash
 
+import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -8,16 +9,22 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -49,6 +56,7 @@ private val ORANGE = Color(0xFFFF9500)
 private val RED = Color(0xFFFF3B30)
 private val TRACK = Color(0xFF2C2C2E)
 private val LABEL_GRAY = Color(0xFF8E8E93)
+private val CARD_BG = Color(0xFF2C2C2E)
 
 /**
  * 리튬이온 셀 전압 → 잔량(%) 방전곡선.
@@ -106,13 +114,19 @@ class MainActivity : ComponentActivity() {
     private var soc by mutableStateOf(0f)
     private var speedKmh by mutableStateOf(0f)
     private var bleConnected by mutableStateOf(false)
-    private var bleLog by mutableStateOf("대기 중")
+    private var bleLog by mutableStateOf("연결 버튼을 눌러 BMS를 찾으세요.")
+    private var scanResults by mutableStateOf<List<BleDevice>>(emptyList())
+    private var isScanning by mutableStateOf(false)
+    private var connectedName by mutableStateOf("")
+
+    private val prefs by lazy { getSharedPreferences("evdash", Context.MODE_PRIVATE) }
 
     private val requestPermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { result ->
         if (result.values.all { it }) {
             gpsTracker.start()
+            autoReconnect()
         } else {
             bleLog = "권한이 거부되어 BLE/GPS를 사용할 수 없습니다."
         }
@@ -134,8 +148,19 @@ class MainActivity : ComponentActivity() {
         bleManager = DalyBleManager(
             context = this,
             onData = { v, c, s -> voltage = v; current = c; soc = s },
-            onConnectionState = { connected -> bleConnected = connected },
-            onLog = { msg -> bleLog = msg }
+            onConnectionState = { connected ->
+                bleConnected = connected
+                if (!connected) connectedName = ""
+            },
+            onLog = { msg -> bleLog = msg },
+            onScanResults = { list -> scanResults = list },
+            onScanningChanged = { s -> isScanning = s },
+            onDeviceConnected = { name, address ->
+                connectedName = name
+                // 다음에 앱 켜면 자동으로 붙게 기억해둔다
+                prefs.edit().putString("last_address", address)
+                    .putString("last_name", name).apply()
+            }
         )
         gpsTracker = GpsSpeedTracker(this) { speedKmh = it }
 
@@ -147,13 +172,30 @@ class MainActivity : ComponentActivity() {
                 speedKmh = speedKmh,
                 bleConnected = bleConnected,
                 bleLog = bleLog,
-                onRequestPermissions = { requestNeededPermissions() },
-                onScanConnect = { bleManager.startScanAndConnect() },
-                onConnectByAddress = { addr -> bleManager.connectToAddress(addr) }
+                scanResults = scanResults,
+                isScanning = isScanning,
+                connectedName = connectedName,
+                savedName = prefs.getString("last_name", null),
+                onStartScan = { bleManager.startScan() },
+                onStopScan = { bleManager.stopScan() },
+                onPickDevice = { dev -> bleManager.connectToDevice(dev) },
+                onConnectByAddress = { addr -> bleManager.connectToAddress(addr) },
+                onForgetDevice = {
+                    prefs.edit().remove("last_address").remove("last_name").apply()
+                    bleLog = "기억된 기기를 지웠습니다."
+                }
             )
         }
 
         requestNeededPermissions()
+    }
+
+    /** 저장된 기기가 있으면 앱 켜자마자 자동 연결 */
+    private fun autoReconnect() {
+        val addr = prefs.getString("last_address", null) ?: return
+        val name = prefs.getString("last_name", "저장된 기기")
+        bleLog = "$name 에 자동 연결 중..."
+        bleManager.connectToAddress(addr)
     }
 
     private fun requestNeededPermissions() {
@@ -182,9 +224,15 @@ fun DashboardScreen(
     speedKmh: Float,
     bleConnected: Boolean,
     bleLog: String,
-    onRequestPermissions: () -> Unit,
-    onScanConnect: () -> Unit,
-    onConnectByAddress: (String) -> Unit
+    scanResults: List<BleDevice>,
+    isScanning: Boolean,
+    connectedName: String,
+    savedName: String?,
+    onStartScan: () -> Unit,
+    onStopScan: () -> Unit,
+    onPickDevice: (BleDevice) -> Unit,
+    onConnectByAddress: (String) -> Unit,
+    onForgetDevice: () -> Unit
 ) {
     var showConnectDialog by remember { mutableStateOf(false) }
 
@@ -258,7 +306,6 @@ fun DashboardScreen(
 
                 Spacer(modifier = Modifier.height((h * 0.025f).dp))
 
-                // 배터리 게이지
                 HorizontalBar(
                     fraction = animBattery / 100f,
                     color = batteryAccent,
@@ -268,7 +315,6 @@ fun DashboardScreen(
 
                 Spacer(modifier = Modifier.height((h * 0.05f).dp))
 
-                // 전압 / 전류 (작게 아래에)
                 Row(
                     verticalAlignment = Alignment.Bottom,
                     horizontalArrangement = Arrangement.Center
@@ -353,7 +399,6 @@ fun DashboardScreen(
 
                 Spacer(modifier = Modifier.width((h * 0.035f).dp))
 
-                // 출력 게이지 (세로)
                 VerticalBar(
                     fraction = animPower / POWER_GAUGE_MAX,
                     color = powerAccent,
@@ -363,7 +408,7 @@ fun DashboardScreen(
             }
         }
 
-        // 좌상단 상태 표시 + 연결 버튼 (평소엔 작고 눈에 안 띄게)
+        // 좌상단 상태 표시 + 연결 버튼
         Row(
             modifier = Modifier
                 .align(Alignment.TopStart)
@@ -373,16 +418,16 @@ fun DashboardScreen(
             Box(
                 modifier = Modifier
                     .size(10.dp)
-                    .background(
-                        if (bleConnected) GREEN else RED,
-                        shape = CircleShape
-                    )
+                    .background(if (bleConnected) GREEN else RED, shape = CircleShape)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
-                text = if (bleConnected) "BMS 연결됨 (BMS SOC ${"%.0f".format(soc)}%)" else "BMS 미연결",
+                text = if (bleConnected)
+                    "$connectedName (BMS SOC ${"%.0f".format(soc)}%)"
+                else "BMS 미연결",
                 color = Color.Gray,
-                fontSize = 12.sp
+                fontSize = 12.sp,
+                maxLines = 1
             )
             Spacer(modifier = Modifier.width(12.dp))
             TextButton(onClick = { showConnectDialog = true }) {
@@ -394,10 +439,187 @@ fun DashboardScreen(
     if (showConnectDialog) {
         ConnectDialog(
             bleLog = bleLog,
-            onDismiss = { showConnectDialog = false },
-            onScan = { onRequestPermissions(); onScanConnect(); showConnectDialog = false },
-            onConnectAddress = { addr -> onConnectByAddress(addr); showConnectDialog = false }
+            scanResults = scanResults,
+            isScanning = isScanning,
+            savedName = savedName,
+            onDismiss = { onStopScan(); showConnectDialog = false },
+            onStartScan = onStartScan,
+            onPickDevice = { dev -> onPickDevice(dev); showConnectDialog = false },
+            onConnectAddress = { addr -> onConnectByAddress(addr); showConnectDialog = false },
+            onForgetDevice = onForgetDevice
         )
+    }
+}
+
+@Composable
+fun ConnectDialog(
+    bleLog: String,
+    scanResults: List<BleDevice>,
+    isScanning: Boolean,
+    savedName: String?,
+    onDismiss: () -> Unit,
+    onStartScan: () -> Unit,
+    onPickDevice: (BleDevice) -> Unit,
+    onConnectAddress: (String) -> Unit,
+    onForgetDevice: () -> Unit
+) {
+    var address by remember { mutableStateOf("") }
+    var showManual by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            color = Color(0xFF1C1C1E),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .widthIn(max = 420.dp)
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "BMS 연결",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (isScanning) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = GREEN
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Button(onClick = onStartScan, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (isScanning) "검색 중..." else "주변 기기 검색")
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (scanResults.isEmpty()) {
+                    Text(
+                        bleLog,
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                } else {
+                    Text(
+                        "기기를 눌러 연결 (DL- 로 시작하는 게 BMS)",
+                        color = LABEL_GRAY,
+                        fontSize = 11.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    scanResults.forEach { dev ->
+                        DeviceRow(dev) { onPickDevice(dev) }
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Row {
+                    TextButton(onClick = {
+                        clipboard.setText(AnnotatedString(bleLog))
+                    }) {
+                        Text("로그 복사", fontSize = 12.sp, color = LABEL_GRAY)
+                    }
+                    TextButton(onClick = { showManual = !showManual }) {
+                        Text("주소 직접 입력", fontSize = 12.sp, color = LABEL_GRAY)
+                    }
+                    if (savedName != null) {
+                        TextButton(onClick = onForgetDevice) {
+                            Text("기기 잊기", fontSize = 12.sp, color = LABEL_GRAY)
+                        }
+                    }
+                }
+
+                if (showManual) {
+                    OutlinedTextField(
+                        value = address,
+                        onValueChange = { address = it },
+                        placeholder = { Text("XX:XX:XX:XX:XX:XX") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = { if (address.isNotBlank()) onConnectAddress(address.trim()) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("주소로 연결")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+                TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+                    Text("닫기")
+                }
+            }
+        }
+    }
+}
+
+/** 스캔 목록의 기기 한 줄 */
+@Composable
+fun DeviceRow(device: BleDevice, onClick: () -> Unit) {
+    Surface(
+        color = CARD_BG,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        device.name,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1
+                    )
+                    if (device.isLikelyBms) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Surface(color = GREEN, shape = RoundedCornerShape(4.dp)) {
+                            Text(
+                                "BMS",
+                                color = Color.Black,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                }
+                Text(
+                    device.address,
+                    color = LABEL_GRAY,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1
+                )
+            }
+            Text(
+                "${device.rssi} dBm",
+                color = LABEL_GRAY,
+                fontSize = 11.sp,
+                maxLines = 1
+            )
+        }
     }
 }
 
@@ -494,50 +716,4 @@ fun GaugeDivider() {
             .padding(vertical = 24.dp)
             .background(Color(0xFF333333))
     )
-}
-
-@Composable
-fun ConnectDialog(
-    bleLog: String,
-    onDismiss: () -> Unit,
-    onScan: () -> Unit,
-    onConnectAddress: (String) -> Unit
-) {
-    var address by remember { mutableStateOf("") }
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            color = Color(0xFF1C1C1E),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                Text("BMS 연결", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(bleLog, color = Color.Gray, fontSize = 13.sp)
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
-                    Text("주변 기기 스캔해서 자동 연결")
-                }
-                Spacer(modifier = Modifier.height(12.dp))
-                Text("또는 MAC 주소 직접 입력", color = Color.Gray, fontSize = 12.sp)
-                OutlinedTextField(
-                    value = address,
-                    onValueChange = { address = it },
-                    placeholder = { Text("XX:XX:XX:XX:XX:XX") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = { if (address.isNotBlank()) onConnectAddress(address) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("주소로 연결")
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
-                    Text("닫기")
-                }
-            }
-        }
-    }
 }

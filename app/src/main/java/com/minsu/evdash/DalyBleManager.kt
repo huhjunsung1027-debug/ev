@@ -5,16 +5,24 @@ import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import java.io.OutputStream
 import java.util.*
+import java.util.concurrent.Executors
 
 /** 스캔으로 발견한 BLE 기기 하나 */
 data class BleDevice(
     val name: String,
     val address: String,
-    val rssi: Int
+    val rssi: Int,
+    /** true면 클래식 블루투스(SPP), false면 BLE */
+    val isClassic: Boolean = false
 ) {
     /** DL- 로 시작하면 BMS 후보 */
     val isLikelyBms: Boolean
@@ -49,6 +57,9 @@ class DalyBleManager(
         private const val TAG = "DalyBLE"
 
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        /** SPP(Serial Port Profile) 표준 UUID. 클래식 블루투스 시리얼 통신용. */
+        val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
         private const val SCAN_TIMEOUT_MS = 12000L
 
@@ -229,6 +240,16 @@ class DalyBleManager(
 
     private val rxBuffer = mutableListOf<Byte>()
 
+    // ── SPP(클래식 블루투스) 상태 ──
+    private var sppSocket: BluetoothSocket? = null
+    private var sppOut: OutputStream? = null
+    private var sppThread: Thread? = null
+    private val sppWriter = Executors.newSingleThreadExecutor()
+    private var discoveryReceiverRegistered = false
+
+    /** SPP로 붙어 있으면 true */
+    private val isSpp: Boolean get() = sppSocket != null
+
     // ─────────────────────────── 스캔 ───────────────────────────
 
     @SuppressLint("MissingPermission")
@@ -249,13 +270,27 @@ class DalyBleManager(
         onScanningChanged(true)
         onLog("주변 기기 검색 중...")
 
+        // 이미 페어링된 기기는 스캔을 기다릴 필요가 없다. 바로 목록에 올린다.
+        try {
+            for (d in adapter.bondedDevices.orEmpty()) {
+                val n = d.name ?: continue
+                foundDevices[d.address] = BleDevice(n, d.address, -50, isClassic = true)
+            }
+            if (foundDevices.isNotEmpty()) publishScanResults()
+        } catch (e: SecurityException) {
+            // 권한 없음 - 무시하고 스캔만 진행
+        }
+
+        // 클래식(SPP) 기기는 BLE 스캔에 안 잡힌다. 별도로 탐색해야 한다.
+        startClassicDiscovery()
+
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val name = result.device.name ?: result.scanRecord?.deviceName ?: return
                 if (name.isBlank()) return
                 val addr = result.device.address ?: return
                 val prev = foundDevices[addr]
-                if (prev == null || result.rssi > prev.rssi) {
+                if (prev == null || (!prev.isClassic && result.rssi > prev.rssi)) {
                     foundDevices[addr] = BleDevice(name, addr, result.rssi)
                     publishScanResults()
                 }
@@ -293,8 +328,69 @@ class DalyBleManager(
         onScanResults(sorted)
     }
 
+    // ─────────────────── 클래식(SPP) 기기 탐색 ───────────────────
+
+    /** 클래식 블루투스 기기가 발견될 때마다 시스템이 던지는 방송을 받는다 */
+    private val discoveryReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(c: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_FOUND) return
+            @Suppress("DEPRECATION")
+            val d = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                ?: return
+            val name = try { d.name } catch (e: SecurityException) { null } ?: return
+            if (name.isBlank()) return
+            val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, (-100).toShort()).toInt()
+            val prev = foundDevices[d.address]
+            if (prev == null || rssi > prev.rssi) {
+                foundDevices[d.address] = BleDevice(name, d.address, rssi, isClassic = true)
+                publishScanResults()
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startClassicDiscovery() {
+        val a = adapter ?: return
+        try {
+            if (!discoveryReceiverRegistered) {
+                val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    context.registerReceiver(
+                        discoveryReceiver, filter, Context.RECEIVER_EXPORTED
+                    )
+                } else {
+                    context.registerReceiver(discoveryReceiver, filter)
+                }
+                discoveryReceiverRegistered = true
+            }
+            if (a.isDiscovering) a.cancelDiscovery()
+            a.startDiscovery()
+        } catch (e: Exception) {
+            Log.w(TAG, "클래식 탐색 실패: ${e.message}")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopClassicDiscovery() {
+        try {
+            if (adapter?.isDiscovering == true) adapter.cancelDiscovery()
+        } catch (e: Exception) {
+            // 무시
+        }
+        if (discoveryReceiverRegistered) {
+            try {
+                context.unregisterReceiver(discoveryReceiver)
+            } catch (e: IllegalArgumentException) {
+                // 이미 해제됨
+            }
+            discoveryReceiverRegistered = false
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun stopScan() {
+        stopClassicDiscovery()
         activeScanCallback?.let { adapter?.bluetoothLeScanner?.stopScan(it) }
         activeScanCallback = null
         scanTimeoutRunnable?.let { handler.removeCallbacks(it) }
@@ -315,7 +411,13 @@ class DalyBleManager(
             onLog("MAC 주소 형식이 잘못되었습니다: $address")
             null
         } ?: return
-        connect(device)
+        // 클래식 전용 기기면 SPP로, 나머지는 BLE로 먼저 시도한다
+        val classicOnly = try {
+            device.type == BluetoothDevice.DEVICE_TYPE_CLASSIC
+        } catch (e: SecurityException) {
+            false
+        }
+        if (classicOnly) connectSpp(device) else connect(device)
     }
 
     @SuppressLint("MissingPermission")
@@ -326,13 +428,123 @@ class DalyBleManager(
             null
         } ?: return
         onLog("${device.name} 연결 중...")
-        connect(d)
+        if (device.isClassic) connectSpp(d) else connect(d)
+    }
+
+    // ─────────────────── SPP(클래식) 연결 ───────────────────
+
+    /**
+     * RFCOMM 소켓으로 연결한다. BLE와 달리 그냥 시리얼 포트다.
+     * connect()가 블로킹이라 반드시 별도 스레드에서 돌려야 한다.
+     */
+    @SuppressLint("MissingPermission")
+    private fun connectSpp(device: BluetoothDevice) {
+        stopScan()
+        onScanResults(emptyList())
+        closeSpp()
+        gatt?.close()
+        gatt = null
+        resetSession()
+
+        // 탐색이 돌고 있으면 연결이 느려지거나 실패한다
+        try { adapter?.cancelDiscovery() } catch (e: Exception) { }
+
+        val t = Thread {
+            var socket: BluetoothSocket? = null
+            try {
+                socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                socket.connect()
+            } catch (e: Exception) {
+                Log.w(TAG, "표준 RFCOMM 실패: ${e.message}")
+                try { socket?.close() } catch (ignored: Exception) { }
+                // 일부 중국산 모듈은 표준 방식으로 안 붙는다. 채널 1로 직접 시도.
+                socket = try {
+                    val m = device.javaClass.getMethod(
+                        "createRfcommSocket", Int::class.javaPrimitiveType
+                    )
+                    (m.invoke(device, 1) as BluetoothSocket).also { it.connect() }
+                } catch (e2: Exception) {
+                    Log.w(TAG, "채널1 RFCOMM 실패: ${e2.message}")
+                    handler.post {
+                        onConnectionState(false)
+                        onLog("SPP 연결 실패: ${e2.message}\n\n" +
+                                "폰 설정에서 이 기기를 먼저 페어링해보세요.")
+                    }
+                    null
+                }
+            }
+
+            val sock = socket ?: return@Thread
+            sppSocket = sock
+            sppOut = try { sock.outputStream } catch (e: Exception) { null }
+
+            handler.post {
+                serviceInfo = "SPP(RFCOMM) 연결됨 - 시리얼 통신"
+                onConnectionState(true)
+                onDeviceConnected(
+                    try { device.name } catch (e: SecurityException) { null } ?: "BMS",
+                    device.address ?: ""
+                )
+                updateStatusLog(true)
+                startPolling()
+            }
+
+            // 수신 루프
+            val buf = ByteArray(1024)
+            try {
+                val input = sock.inputStream
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    val chunk = buf.copyOf(n)
+                    handler.post { handleRx(chunk) }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "SPP 수신 종료: ${e.message}")
+            }
+
+            handler.post {
+                if (sppSocket === sock) {
+                    onLog("SPP 연결이 끊겼습니다.")
+                    onConnectionState(false)
+                    stopPolling()
+                    closeSpp()
+                }
+            }
+        }
+        sppThread = t
+        t.isDaemon = true
+        t.start()
+    }
+
+    /** SPP는 그냥 스트림에 바이트를 밀어넣으면 된다 */
+    private fun sppWrite(frame: ByteArray): Boolean {
+        val out = sppOut ?: return false
+        sppWriter.execute {
+            try {
+                out.write(frame)
+                out.flush()
+                txConfirmed++
+            } catch (e: Exception) {
+                Log.w(TAG, "SPP 송신 실패: ${e.message}")
+            }
+        }
+        return true
+    }
+
+    private fun closeSpp() {
+        try { sppOut?.close() } catch (e: Exception) { }
+        try { sppSocket?.close() } catch (e: Exception) { }
+        sppOut = null
+        sppSocket = null
+        sppThread = null
     }
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
         stopScan()
         onScanResults(emptyList())   // 연결 후엔 로그가 보이도록 목록을 비운다
+        closeSpp()                   // 전송방식 전환 시 이전 소켓 정리
         gatt?.close()
         resetSession()
         gatt = device.connectGatt(context, false, gattCallback)
@@ -573,7 +785,7 @@ class DalyBleManager(
     private val requestRunnable = Runnable { sendRequest() }
 
     private fun startPolling() {
-        if (writeChars.isEmpty()) {
+        if (!isSpp && writeChars.isEmpty()) {
             onLog("쓰기 characteristic이 없습니다.\n일부 BMS는 요청 없이 알림만 보냅니다. 잠시 기다려보세요.")
             return
         }
@@ -597,6 +809,39 @@ class DalyBleManager(
     @Suppress("DEPRECATION")
     private fun sendRequest() {
         if (!polling) return
+
+        // ── SPP 경로: 채널이 하나뿐이라 프레임만 돌아가며 보낸다 ──
+        if (isSpp) {
+            val foundSpp = detectedProtocol
+            var f = if (foundSpp != null) {
+                PROBE_FRAMES.first { it.first == foundSpp }
+            } else {
+                val x = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
+                probeIndex++
+                sweepJustFinished = (probeIndex % PROBE_FRAMES.size == 0)
+                x
+            }
+            if (foundSpp != null) {
+                requestCounter++
+                if (requestCounter % TEMP_EVERY_N == 0) {
+                    DALY_TEMP_FRAMES[foundSpp]?.let { f = "$foundSpp·온도" to it }
+                }
+            }
+            lastTx = "${f.first} \u2192 SPP  ${hex(f.second)}"
+            txTried++
+            if (sppWrite(f.second)) txAccepted++
+            updateStatusLog(false)
+            scheduleNext(
+                when {
+                    foundSpp != null -> RESPONSE_TIMEOUT_MS
+                    sweepJustFinished && rxTotal == 0 -> PASSIVE_LISTEN_MS
+                    else -> PROBE_INTERVAL_MS
+                }
+            )
+            return
+        }
+
+        // ── BLE 경로 ──
         val g = gatt ?: return
         if (writeChars.isEmpty()) return
 
@@ -850,6 +1095,7 @@ class DalyBleManager(
     fun disconnect() {
         stopScan()
         stopPolling()
+        closeSpp()
         gatt?.disconnect()
         gatt?.close()
         gatt = null

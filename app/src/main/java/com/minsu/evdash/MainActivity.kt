@@ -16,6 +16,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -44,6 +46,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.delay
 import kotlin.math.abs
 
 // ═════════════════════════════════════════════════════════════
@@ -113,10 +116,21 @@ fun voltageToPercent(packVoltage: Float): Float {
     return 0f
 }
 
-fun powerColorFor(watt: Float): Color = when {
-    watt <= PWR_GREEN_MAX -> GREEN
-    watt <= PWR_YELLOW_MAX -> YELLOW
-    watt <= PWR_ORANGE_MAX -> ORANGE
+/**
+ * 출력 구간 설정. 테스트 중에 앱에서 바로 바꿀 수 있게 상수가 아니라 상태로 들고 다닌다.
+ * 위쪽 const 값들은 앱 실행 시 초기값으로만 쓰인다.
+ */
+data class PowerConfig(
+    val greenMax: Float = PWR_GREEN_MAX,
+    val yellowMax: Float = PWR_YELLOW_MAX,
+    val orangeMax: Float = PWR_ORANGE_MAX,
+    val gaugeMax: Float = POWER_GAUGE_MAX
+)
+
+fun powerColorFor(watt: Float, cfg: PowerConfig): Color = when {
+    watt <= cfg.greenMax -> GREEN
+    watt <= cfg.yellowMax -> YELLOW
+    watt <= cfg.orangeMax -> ORANGE
     else -> RED
 }
 
@@ -286,13 +300,42 @@ fun DashboardScreen(
     onResetMax: () -> Unit
 ) {
     var showConnectDialog by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
 
-    val power = voltage * current
+    // ── 테스트 모드 상태 ──
+    var powerCfg by remember { mutableStateOf(PowerConfig()) }
+    var demoMode by remember { mutableStateOf(false) }
+    var demoWatts by remember { mutableStateOf(0f) }
+    val pedalSource = remember { MutableInteractionSource() }
+    val pedalPressed by pedalSource.collectIsPressedAsState()
+    val regenSource = remember { MutableInteractionSource() }
+    val regenPressed by regenSource.collectIsPressedAsState()
+
+    // 페달을 누르고 있으면 차오르고, 떼면 서서히 내려간다
+    LaunchedEffect(pedalPressed, regenPressed, demoMode) {
+        if (!demoMode) return@LaunchedEffect
+        val ceiling = powerCfg.gaugeMax * 1.1f
+        while (true) {
+            demoWatts = when {
+                pedalPressed -> (demoWatts + ceiling * 0.022f).coerceAtMost(ceiling)
+                regenPressed -> (demoWatts - ceiling * 0.018f).coerceAtLeast(-ceiling * 0.35f)
+                else -> {
+                    // 아무것도 안 누르면 0으로 수렴
+                    val d = demoWatts * 0.90f
+                    if (abs(d) < 20f) 0f else d
+                }
+            }
+            delay(30)
+        }
+    }
+
+    // 데모 모드면 실제 BMS 값 대신 가상 출력을 쓴다
+    val power = if (demoMode) demoWatts else voltage * current
     val powerAbs = abs(power)
-    val powerAccent = powerColorFor(powerAbs)
+    val powerAccent = powerColorFor(powerAbs, powerCfg)
     val batteryPct = voltageToPercent(voltage)
     val batteryAccent = batteryColorFor(batteryPct)
-    val isCharging = current < -CHARGING_THRESHOLD_A
+    val isCharging = if (demoMode) power < -1f else current < -CHARGING_THRESHOLD_A
     val powerDisplayColor = if (isCharging) GREEN else powerAccent
 
     val animBattery by animateFloatAsState(targetValue = batteryPct, label = "battery")
@@ -330,9 +373,9 @@ fun DashboardScreen(
             // ══════ 상단 출력 바 ══════
             // 패딩 밖에 둬야 화면 좌우 끝까지 꽉 찬다
             PowerBar(
-                fraction = animPower / POWER_GAUGE_MAX,
+                fraction = animPower / powerCfg.gaugeMax,
                 barHeight = ledSize,
-                overLimit = powerAbs > PWR_ORANGE_MAX,
+                overLimit = powerAbs > powerCfg.orangeMax,
                 pulseAlpha = pulseAlpha
             )
 
@@ -388,6 +431,14 @@ fun DashboardScreen(
                             if (isCharging) GREEN else CYAN,
                             chipText, rowH
                         )
+                        Spacer(modifier = Modifier.height((gap * 0.5f).dp))
+                        StatusChip(
+                            "설정",
+                            if (demoMode) "TEST" else "\u2699",
+                            if (demoMode) ORANGE else LABEL_GRAY,
+                            chipText, rowH,
+                            onClick = { showSettings = true }
+                        )
                     }
 
                     Spacer(modifier = Modifier.width((gap * 0.6f).dp))
@@ -409,6 +460,30 @@ fun DashboardScreen(
                             if (tempC.isNaN()) LABEL_GRAY else tempColorFor(tempC),
                             cellText, rowH
                         )
+
+                        // ── 테스트용 가상 페달 (데모 모드일 때만) ──
+                        if (demoMode) {
+                            Spacer(modifier = Modifier.height((gap * 0.6f).dp))
+                            Row(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                                PedalButton(
+                                    label = "가속",
+                                    accent = ORANGE,
+                                    pressed = pedalPressed,
+                                    interactionSource = pedalSource,
+                                    textSize = cellText,
+                                    modifier = Modifier.weight(2f).fillMaxHeight()
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                PedalButton(
+                                    label = "회생",
+                                    accent = GREEN,
+                                    pressed = regenPressed,
+                                    interactionSource = regenSource,
+                                    textSize = cellText,
+                                    modifier = Modifier.weight(1f).fillMaxHeight()
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -592,6 +667,16 @@ fun DashboardScreen(
         }
     }
 
+    if (showSettings) {
+        SettingsDialog(
+            cfg = powerCfg,
+            demoMode = demoMode,
+            onCfgChange = { powerCfg = it },
+            onDemoChange = { demoMode = it; if (!it) demoWatts = 0f },
+            onDismiss = { showSettings = false }
+        )
+    }
+
     if (showConnectDialog) {
         ConnectDialog(
             bleLog = bleLog,
@@ -661,6 +746,170 @@ fun PowerBar(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * 누르고 있는 동안만 동작하는 페달 버튼.
+ * Button의 기본 클릭은 "눌렀다 뗐을 때" 한 번 발생해서 쓸 수 없다.
+ * InteractionSource로 눌림 상태를 직접 관찰해야 한다.
+ */
+@Composable
+fun PedalButton(
+    label: String,
+    accent: Color,
+    pressed: Boolean,
+    interactionSource: MutableInteractionSource,
+    textSize: Float,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (pressed) accent else PANEL)
+            .border(
+                1.dp,
+                if (pressed) accent else accent.copy(alpha = 0.5f),
+                RoundedCornerShape(6.dp)
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = { }   // 실제 동작은 눌림 상태로 처리한다
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            color = if (pressed) Color.Black else accent,
+            fontSize = textSize.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1
+        )
+    }
+}
+
+/** 테스트용 설정 다이얼로그 - 출력 구간과 데모 모드를 조절한다 */
+@Composable
+fun SettingsDialog(
+    cfg: PowerConfig,
+    demoMode: Boolean,
+    onCfgChange: (PowerConfig) -> Unit,
+    onDemoChange: (Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(color = Color(0xFF1C1C1E), shape = RoundedCornerShape(16.dp)) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .widthIn(max = 440.dp)
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    "테스트 설정",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 데모 모드 토글
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("가상 페달", color = Color.White, fontSize = 14.sp)
+                        Text(
+                            "BMS 없이 화면만 확인할 때 사용",
+                            color = LABEL_GRAY,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(checked = demoMode, onCheckedChange = onDemoChange)
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("출력 구간 (W)", color = LABEL_GRAY, fontSize = 12.sp)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                ThresholdRow("초록 상한", cfg.greenMax, GREEN, 500f) {
+                    onCfgChange(cfg.copy(greenMax = it))
+                }
+                ThresholdRow("노랑 상한", cfg.yellowMax, YELLOW, 500f) {
+                    onCfgChange(cfg.copy(yellowMax = it))
+                }
+                ThresholdRow("주황 상한", cfg.orangeMax, ORANGE, 500f) {
+                    onCfgChange(cfg.copy(orangeMax = it))
+                }
+                ThresholdRow("게이지 최대", cfg.gaugeMax, CYAN, 1000f) {
+                    onCfgChange(cfg.copy(gaugeMax = it))
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    "주황 상한을 넘으면 상단 바 전체가 빨갛게 점멸한다.",
+                    color = LABEL_GRAY,
+                    fontSize = 11.sp
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+                TextButton(
+                    onClick = { onCfgChange(PowerConfig()) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("기본값으로 되돌리기", fontSize = 13.sp, color = LABEL_GRAY)
+                }
+                TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+                    Text("닫기")
+                }
+            }
+        }
+    }
+}
+
+/** 설정 다이얼로그의 숫자 조절 한 줄 (− 값 +) */
+@Composable
+fun ThresholdRow(
+    label: String,
+    value: Float,
+    accent: Color,
+    step: Float,
+    onChange: (Float) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .background(accent, CircleShape)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(label, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+
+        TextButton(
+            onClick = { onChange((value - step).coerceAtLeast(0f)) },
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+        ) {
+            Text("\u2212", fontSize = 18.sp, color = Color.White)
+        }
+        Text(
+            "%.0f".format(value),
+            color = accent,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.widthIn(min = 56.dp),
+            maxLines = 1
+        )
+        TextButton(
+            onClick = { onChange(value + step) },
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp)
+        ) {
+            Text("+", fontSize = 18.sp, color = Color.White)
         }
     }
 }

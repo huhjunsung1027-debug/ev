@@ -338,9 +338,11 @@ fun DashboardScreen(
 
             Column(
                 modifier = Modifier
-                    .fillMaxSize()
+                    .fillMaxWidth()
+                    .weight(1f)          // 출력 바가 차지한 높이를 뺀 나머지
                     .padding(
-                        horizontal = (w * 0.014f).dp,
+                        start = (w * 0.014f).dp,
+                        end = (w * 0.014f).dp,
                         top = (h * 0.018f).dp,
                         bottom = (h * 0.022f).dp
                     )

@@ -314,7 +314,7 @@ fun DashboardScreen(
         val h = maxHeight.value
         val w = maxWidth.value
 
-        val ledSize = (h * 0.030f).coerceIn(7f, 20f)
+        val ledSize = (h * 0.055f).coerceIn(10f, 34f)   // 상단 출력 바 높이
         val logoH = (h * 0.105f).coerceIn(22f, 70f)
         val rowH = (h * 0.082f).coerceIn(20f, 54f)
         val chipText = (h * 0.038f).coerceIn(9f, 22f)
@@ -325,21 +325,26 @@ fun DashboardScreen(
         val tinyText = (h * 0.034f).coerceIn(8f, 20f)
         val gap = (h * 0.018f).coerceIn(3f, 12f)
 
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = (w * 0.014f).dp, vertical = (h * 0.022f).dp)
-        ) {
+        Column(modifier = Modifier.fillMaxSize()) {
 
-            // ══════ 상단 LED 바 (출력) ══════
-            PowerLedStrip(
+            // ══════ 상단 출력 바 ══════
+            // 패딩 밖에 둬야 화면 좌우 끝까지 꽉 찬다
+            PowerBar(
                 fraction = animPower / POWER_GAUGE_MAX,
-                dotSize = ledSize,
+                barHeight = ledSize,
                 overLimit = powerAbs > PWR_ORANGE_MAX,
                 pulseAlpha = pulseAlpha
             )
 
-            Spacer(modifier = Modifier.height(gap.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(
+                        horizontal = (w * 0.014f).dp,
+                        top = (h * 0.018f).dp,
+                        bottom = (h * 0.022f).dp
+                    )
+            ) {
 
             // ══════ 팀 로고 ══════
             Image(
@@ -407,44 +412,11 @@ fun DashboardScreen(
 
                 Spacer(modifier = Modifier.width((gap * 0.8f).dp))
 
-                // ───── 가운데: 배터리% / 속도 / 출력 ─────
+                // ───── 가운데: 속도 / 출력 ─────
                 Column(
                     modifier = Modifier.weight(0.92f),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // 배터리 % (레퍼런스의 속도 박스 자리)
-                    Panel(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier.padding(vertical = (gap * 0.4f).dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            if (isCharging) {
-                                BoltIcon(
-                                    sizeDp = midSize * 0.85f,
-                                    color = GREEN.copy(alpha = pulseAlpha),
-                                    modifier = Modifier.padding(end = 5.dp)
-                                )
-                            }
-                            Text(
-                                "%.0f".format(batteryPct),
-                                color = batteryAccent,
-                                fontSize = midSize.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1
-                            )
-                            Text(
-                                "%",
-                                color = batteryAccent.copy(alpha = 0.7f),
-                                fontSize = tinyText.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(start = 3.dp)
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height((gap * 0.5f).dp))
-
                     // 속도 (히어로)
                     Panel(modifier = Modifier.fillMaxWidth().weight(1f)) {
                         Column(
@@ -510,7 +482,10 @@ fun DashboardScreen(
                     // 배터리 잔량 블록
                     Panel(modifier = Modifier.fillMaxWidth().weight(1f)) {
                         Column(modifier = Modifier.fillMaxSize()) {
-                            HeaderBar("배터리 잔량", tinyText, rowH * 0.62f)
+                            HeaderBar(
+                                if (isCharging) "배터리 충전 중" else "배터리 잔량",
+                                tinyText, rowH * 0.62f
+                            )
                             Column(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -521,6 +496,16 @@ fun DashboardScreen(
                                     verticalAlignment = Alignment.Bottom,
                                     modifier = Modifier.align(Alignment.CenterHorizontally)
                                 ) {
+                                    if (isCharging) {
+                                        BoltIcon(
+                                            sizeDp = pctSize * 0.55f,
+                                            color = GREEN.copy(alpha = pulseAlpha),
+                                            modifier = Modifier.padding(
+                                                end = 5.dp,
+                                                bottom = (pctSize * 0.10f).dp
+                                            )
+                                        )
+                                    }
                                     Text(
                                         "%.0f".format(batteryPct),
                                         color = batteryAccent,
@@ -601,6 +586,7 @@ fun DashboardScreen(
                     }
                 }
             }
+            }
         }
     }
 
@@ -621,40 +607,58 @@ fun DashboardScreen(
 
 // ═══════════════════ 계기판 구성요소 ═══════════════════
 
-/** 상단 출력 LED 바. 왼쪽부터 차오르고 구간별로 색이 바뀐다. */
+/**
+ * 상단 출력 바. 화면 좌우 끝까지 꽉 차게 그린다.
+ * 왼쪽부터 차오르고 구간(초록-노랑-주황-빨강)별로 색이 바뀐다.
+ * 마지막 칸은 부분적으로 차오르게 해서 눈금 사이에서도 변화가 보인다.
+ */
 @Composable
-fun PowerLedStrip(
+fun PowerBar(
     fraction: Float,
-    dotSize: Float,
+    barHeight: Float,
     overLimit: Boolean,
     pulseAlpha: Float
 ) {
-    val lit = (fraction.coerceIn(0f, 1f) * LED_COUNT)
+    val lit = fraction.coerceIn(0f, 1f) * LED_COUNT
     Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(barHeight.dp)
+            .background(Color.Black)
     ) {
         for (i in 0 until LED_COUNT) {
-            val isOn = i < lit
             val zoneColor = when {
                 i < LED_COUNT * 0.50f -> GREEN
                 i < LED_COUNT * 0.70f -> YELLOW
                 i < LED_COUNT * 0.87f -> ORANGE
                 else -> RED
             }
-            // 한계 초과면 전체가 빨갛게 깜빡인다
-            val color = when {
-                overLimit -> RED.copy(alpha = pulseAlpha)
-                isOn -> zoneColor
-                else -> LED_OFF
-            }
+            // 이 칸이 얼마나 차 있나 (0~1). 마지막 칸이 부분적으로 찬다.
+            val cellFill = (lit - i).coerceIn(0f, 1f)
+
             Box(
                 modifier = Modifier
-                    .padding(horizontal = (dotSize * 0.16f).dp)
-                    .size(dotSize.dp)
-                    .background(color, CircleShape)
-            )
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .padding(horizontal = 0.7.dp)
+                    .background(LED_OFF)
+            ) {
+                if (overLimit) {
+                    // 한계 초과 - 전체가 빨갛게 깜빡인다
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(RED.copy(alpha = pulseAlpha))
+                    )
+                } else if (cellFill > 0f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(cellFill)
+                            .fillMaxHeight()
+                            .background(zoneColor)
+                    )
+                }
+            }
         }
     }
 }

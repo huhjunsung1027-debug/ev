@@ -22,8 +22,16 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Android SDK 설치
-        uses: android-actions/setup-android@v3
+      # GitHub 러너에는 Android SDK가 이미 설치돼 있다.
+      # setup-android 액션은 이걸 다시 받으려다 자주 깨져서 쓰지 않는다.
+      - name: Android SDK 확인
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/platforms" || true
+          ls "$ANDROID_HOME/build-tools" || true
+          # 라이선스 동의 (이미 돼 있으면 조용히 통과)
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
 
       - name: gradlew 실행권한
         run: chmod +x ./gradlew

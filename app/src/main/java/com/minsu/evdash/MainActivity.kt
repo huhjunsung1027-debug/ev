@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -77,6 +78,9 @@ private const val TEMP_COLD_C = 0f
 
 /** 상단 LED 바 개수 */
 private const val LED_COUNT = 20
+
+/** 출력 한계 초과 시 점멸 반주기 (ms). 왕복 한 사이클은 이 값의 2배. */
+private const val ALERT_BLINK_MS = 100
 
 private val GREEN = Color(0xFF34D058)
 private val YELLOW = Color(0xFFFFD60A)
@@ -342,11 +346,25 @@ fun DashboardScreen(
     val animPower by animateFloatAsState(targetValue = powerAbs, label = "power")
 
     val pulse = rememberInfiniteTransition(label = "pulse")
+
+    // 충전 번개 - 느긋하게 숨쉬듯
     val pulseAlpha by pulse.animateFloat(
         initialValue = 0.3f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(tween(650), repeatMode = RepeatMode.Reverse),
         label = "pulseAlpha"
+    )
+
+    // 출력 한계 경고 - 눈에 확 띄게 빠른 점멸 (0.1초 주기)
+    // LinearEasing 을 써야 부드럽게 뭉개지지 않고 딱딱 끊긴다
+    val alertAlpha by pulse.animateFloat(
+        initialValue = 0.12f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(ALERT_BLINK_MS, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "alertAlpha"
     )
 
     BoxWithConstraints(
@@ -376,7 +394,7 @@ fun DashboardScreen(
                 fraction = animPower / powerCfg.gaugeMax,
                 barHeight = ledSize,
                 overLimit = powerAbs > powerCfg.orangeMax,
-                pulseAlpha = pulseAlpha
+                pulseAlpha = alertAlpha
             )
 
             Column(

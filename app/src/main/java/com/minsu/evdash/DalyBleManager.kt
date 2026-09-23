@@ -16,23 +16,25 @@ data class BleDevice(
     val address: String,
     val rssi: Int
 ) {
-    /** DL- 로 시작하면 BMS 후보 */
+    /** BMS 후보로 보이는 이름인지 */
     val isLikelyBms: Boolean
         get() = name.startsWith("DL-", ignoreCase = true) ||
                 name.contains("daly", ignoreCase = true) ||
-                name.contains("bms", ignoreCase = true)
+                name.contains("bms", ignoreCase = true) ||
+                name.startsWith("BT", ignoreCase = true)
 }
 
 /**
  * BMS(BLE) 연결/파싱 매니저.
  *
- * 서비스 UUID도, 통신 프로토콜도 고정하지 않는다.
- *  - UUID: Notify + Write 를 둘 다 가진 커스텀 서비스를 자동 선택
- *  - 프로토콜: 알려진 요청 프레임을 순서대로 찔러보고, 응답이 해석되는 놈으로 고정
+ * 지원 프로토콜
+ *  1) LWS  - 순정 앱(SmartBMS-Lion1) APK를 디컴파일해서 실측한 규격.
+ *            프레임: 3A 16 [cmd] [len] <data> [체크섬 2B LE] 0D 0A
+ *            0x2A(realtime) 응답 하나에 전압·전류·온도·SOC가 전부 들어있다.
+ *  2) Daly - A5 [addr] [cmd] 08 <8B> [체크섬]
+ *  3) JBD  - DD A5 [cmd] 00 <...> 77
  *
- * 갱신 속도:
- *  고정 타이머로 1초마다 쏘는 게 아니라, 응답이 오는 즉시 다음 요청을 보낸다.
- *  BMS가 답하는 만큼 최대한 빠르게 돈다 (보통 5~8Hz).
+ * 연결 후 어느 프로토콜인지 모르면 순서대로 찔러보고, 값이 해석되는 놈으로 고정한다.
  */
 class DalyBleManager(
     private val context: Context,
@@ -51,7 +53,7 @@ class DalyBleManager(
 
         private const val SCAN_TIMEOUT_MS = 12000L
 
-        /** 응답 받고 다음 요청까지 최소 간격 (ms). 너무 줄이면 BMS가 못 따라온다. */
+        /** 응답 받고 다음 요청까지 최소 간격 (ms) */
         private const val MIN_GAP_MS = 120L
 
         /** 이 시간 안에 응답이 없으면 같은 요청을 다시 보낸다 (ms) */
@@ -60,10 +62,10 @@ class DalyBleManager(
         /** 프로토콜 탐색 중 다음 후보로 넘어가는 간격 (ms) */
         private const val PROBE_INTERVAL_MS = 700L
 
-        /** 진단 로그 갱신 최소 간격 (ms). 매 패킷마다 갱신하면 화면이 버벅인다. */
+        /** 진단 로그 갱신 최소 간격 (ms) */
         private const val LOG_THROTTLE_MS = 500L
 
-        /** 이 횟수마다 한 번씩 온도를 물어본다 (Daly 전용) */
+        /** Daly 전용 - 이 횟수마다 한 번씩 온도를 따로 물어본다 */
         private const val TEMP_EVERY_N = 5
 
         /**
@@ -82,38 +84,47 @@ class DalyBleManager(
             "1800", "1801", "1804", "180a", "180f", "1811", "fe59"
         )
 
-        /**
-         * Daly 요청 프레임 만들기.
-         * 형식: A5 [주소] [커맨드] [길이=08] [데이터 8바이트] [체크섬] = 총 13바이트
-         */
+        // ── LWS 프레임 ──
+        // 3A 16 [cmd] [len=00] [체크섬 lo] [체크섬 hi] 0D 0A
+        // 체크섬 = e[1]..e[n-5] 합 = (0x16 + cmd), 16비트 리틀엔디안
+        private fun lwsFrame(cmd: Int): ByteArray {
+            val sum = (0x16 + cmd) and 0xFFFF
+            return byteArrayOf(
+                0x3A, 0x16, cmd.toByte(), 0x00,
+                (sum and 0xFF).toByte(), ((sum shr 8) and 0xFF).toByte(),
+                0x0D, 0x0A
+            )
+        }
+
+        /** Daly 요청: A5 [addr] [cmd] 08 <8바이트> [체크섬] = 13바이트 */
         private fun dalyFrame(addr: Int, cmd: Int): ByteArray {
             val body = ByteArray(12)
             body[0] = 0xA5.toByte()
             body[1] = addr.toByte()
             body[2] = cmd.toByte()
             body[3] = 0x08
-            // body[4..11] 은 0x00 (데이터 8바이트)
             val sum = body.fold(0) { acc, b -> acc + (b.toInt() and 0xFF) }
             return body + (sum and 0xFF).toByte()
         }
 
-        /** 찔러볼 요청 프레임 목록. 전부 조회(read) 명령만 쓴다. */
+        /**
+         * 찔러볼 요청 프레임. 전부 조회(read) 명령만 쓴다.
+         * LWS를 맨 앞에 두는 이유: 0x2A 응답 하나에 필요한 값이 다 들어있어서
+         * 확정되면 그 뒤로는 한 종류만 반복하면 된다.
+         */
         private val PROBE_FRAMES: List<Pair<String, ByteArray>> by lazy {
             listOf(
+                "LWS" to lwsFrame(0x2A),          // 실시간 데이터
                 "Daly(40)" to dalyFrame(0x40, 0x90),
                 "Daly(80)" to dalyFrame(0x80, 0x90),
                 "JBD" to byteArrayOf(
                     0xDD.toByte(), 0xA5.toByte(), 0x03, 0x00,
                     0xFF.toByte(), 0xFD.toByte(), 0x77
-                ),
-                "Modbus" to byteArrayOf(
-                    0xD2.toByte(), 0x03, 0x00, 0x00, 0x00, 0x3E,
-                    0xD7.toByte(), 0xB9.toByte()
                 )
             )
         }
 
-        /** Daly 온도 조회 프레임 (커맨드 0x92) */
+        /** Daly는 온도가 별도 커맨드다. LWS/JBD는 기본 응답에 이미 들어있다. */
         private val DALY_TEMP_FRAMES: Map<String, ByteArray> by lazy {
             mapOf(
                 "Daly(40)" to dalyFrame(0x40, 0x92),
@@ -157,7 +168,7 @@ class DalyBleManager(
         private set
 
     // ── 프로토콜 탐색 / 통신 상태 ──
-    private var detectedProtocol: String? = null   // null이면 아직 탐색 중
+    private var detectedProtocol: String? = null
     private var probeIndex = 0
     private var requestCounter = 0
     private var lastTx = ""
@@ -167,7 +178,6 @@ class DalyBleManager(
     private var polling = false
     private var lastLogUpdate = 0L
 
-    /** 실제 갱신 주기 측정용 */
     private var lastParseTime = 0L
     private var updateHz = 0f
 
@@ -276,7 +286,7 @@ class DalyBleManager(
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
         stopScan()
-        onScanResults(emptyList())   // 연결 후엔 로그가 보이도록 목록을 비운다
+        onScanResults(emptyList())
         gatt?.close()
         resetSession()
         gatt = device.connectGatt(context, false, gattCallback)
@@ -305,10 +315,8 @@ class DalyBleManager(
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 onLog("연결됨. 서비스 확인 중...")
-                // BLE 기본 연결 간격은 50ms 안팎이다. 이걸 안 낮추면
-                // 아무리 빨리 요청해도 그 이하로는 못 내려간다.
                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                g.requestMtu(247)   // 긴 응답 프레임이 잘리지 않게
+                g.requestMtu(247)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 onLog("연결이 끊겼습니다. (status=$status)")
                 onConnectionState(false)
@@ -326,20 +334,29 @@ class DalyBleManager(
             lastServiceDump = buildDump(g)
             Log.d(TAG, "SERVICES:\n$lastServiceDump")
 
-            // Notify 와 Write 를 둘 다 가진 커스텀 서비스를 고른다
-            val target = g.services.firstOrNull { svc ->
-                !isStandardService(svc.uuid) &&
-                        findNotify(svc) != null && findWrite(svc) != null
-            }
-
+            val target = pickService(g)
             if (target == null) {
                 onConnectionState(false)
                 onLog("통신용 서비스를 찾지 못했습니다.\n\n발견된 구조:\n$lastServiceDump")
                 return
             }
 
-            notifyChar = findNotify(target)
-            writeChar = findWrite(target)
+            // ── 여기가 핵심 ──
+            // 순정 앱은 characteristics[0] 을 알림, [1] 을 쓰기로 쓴다.
+            // 속성(property)만 보고 첫 번째를 고르면 알림용을 쓰기용으로 잡는다.
+            // ffe2 처럼 쓰기+알림을 둘 다 가진 놈이 앞에 오면 그대로 틀린다.
+            val chars = target.characteristics
+            notifyChar = chars.getOrNull(0)?.takeIf { hasNotify(it) } ?: chars.firstOrNull { hasNotify(it) }
+            writeChar = chars.getOrNull(1)?.takeIf { hasWrite(it) }
+                ?: chars.firstOrNull { hasWrite(it) && it !== notifyChar }
+                ?: chars.firstOrNull { hasWrite(it) }
+
+            if (notifyChar == null || writeChar == null) {
+                onConnectionState(false)
+                onLog("알림/쓰기 characteristic을 찾지 못했습니다.\n\n$lastServiceDump")
+                return
+            }
+
             writeType = if (writeChar!!.properties and
                 BluetoothGattCharacteristic.PROPERTY_WRITE != 0
             ) {
@@ -355,7 +372,6 @@ class DalyBleManager(
             g.setCharacteristicNotification(notifyChar, true)
             val cccd = notifyChar!!.getDescriptor(CCCD_UUID)
             if (cccd != null) {
-                // CCCD 쓰기가 끝난 뒤 폴링을 시작해야 첫 요청이 씹히지 않는다.
                 @Suppress("DEPRECATION")
                 cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 @Suppress("DEPRECATION")
@@ -391,6 +407,26 @@ class DalyBleManager(
         }
     }
 
+    private fun hasNotify(c: BluetoothGattCharacteristic) =
+        c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+
+    private fun hasWrite(c: BluetoothGattCharacteristic) =
+        c.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+
+    /** ffe0 가 있으면 그쪽을 우선한다 (순정 앱이 그렇게 고른다) */
+    private fun pickService(g: BluetoothGatt): BluetoothGattService? {
+        val usable = g.services.filter {
+            !isStandardService(it.uuid) &&
+                    it.characteristics.any { c -> hasNotify(c) } &&
+                    it.characteristics.any { c -> hasWrite(c) }
+        }
+        return usable.firstOrNull { shortUuid(it.uuid).equals("ffe0", true) }
+            ?: usable.firstOrNull { shortUuid(it.uuid).equals("fff0", true) }
+            ?: usable.firstOrNull()
+    }
+
     private fun handleRx(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         Log.d(TAG, "RX: ${hex(bytes)}")
@@ -399,7 +435,7 @@ class DalyBleManager(
         while (rxLines.size > 5) rxLines.removeAt(0)
 
         rxBuffer.addAll(bytes.toList())
-        if (rxBuffer.size > 512) rxBuffer.clear()
+        if (rxBuffer.size > 1024) rxBuffer.clear()
         tryParseBuffer()
         updateStatusLog(false)
     }
@@ -412,10 +448,6 @@ class DalyBleManager(
         startPolling()
     }
 
-    /**
-     * 연결 창에 뿌릴 진단 문자열.
-     * 매 패킷마다 갱신하면 화면 전체가 다시 그려져서 오히려 버벅인다.
-     */
     private fun updateStatusLog(force: Boolean) {
         val now = SystemClock.elapsedRealtime()
         if (!force && now - lastLogUpdate < LOG_THROTTLE_MS) return
@@ -436,22 +468,8 @@ class DalyBleManager(
         onLog(sb.toString())
     }
 
-    // ─────────────────── 서비스 자동 탐색 도우미 ───────────────────
-
     private fun isStandardService(uuid: UUID): Boolean =
         shortUuid(uuid).lowercase() in STANDARD_SERVICES
-
-    private fun findNotify(svc: BluetoothGattService): BluetoothGattCharacteristic? =
-        svc.characteristics.firstOrNull {
-            it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
-                    BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-        }
-
-    private fun findWrite(svc: BluetoothGattService): BluetoothGattCharacteristic? =
-        svc.characteristics.firstOrNull {
-            it.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-        }
 
     private fun buildDump(g: BluetoothGatt): String {
         val sb = StringBuilder()
@@ -459,7 +477,7 @@ class DalyBleManager(
             sb.append("[${shortUuid(svc.uuid)}]")
             if (isStandardService(svc.uuid)) sb.append(" (표준)")
             sb.append("\n")
-            for (ch in svc.characteristics) {
+            for ((i, ch) in svc.characteristics.withIndex()) {
                 val p = ch.properties
                 val flags = buildString {
                     if (p and BluetoothGattCharacteristic.PROPERTY_READ != 0) append("R")
@@ -468,7 +486,7 @@ class DalyBleManager(
                     if (p and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) append("N")
                     if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) append("I")
                 }
-                sb.append("   ${shortUuid(ch.uuid)}  $flags\n")
+                sb.append("  [$i] ${shortUuid(ch.uuid)}  $flags\n")
             }
         }
         return sb.toString().trimEnd()
@@ -476,10 +494,6 @@ class DalyBleManager(
 
     // ─────────────────────────── 송신 ───────────────────────────
 
-    /**
-     * 고정 타이머가 아니라 요청-응답 방식.
-     * 보낼 때 타임아웃을 걸어두고, 응답이 먼저 오면 그 즉시 다음 요청을 앞당긴다.
-     */
     private val requestRunnable = Runnable { sendRequest() }
 
     private fun startPolling() {
@@ -519,8 +533,7 @@ class DalyBleManager(
             name = f.first
             frame = f.second
 
-            // Daly는 온도가 별도 커맨드(0x92)라 가끔 한 번씩 섞어 보낸다.
-            // JBD는 기본 응답에 온도가 이미 들어있어서 필요 없다.
+            // Daly만 온도가 별도 커맨드다
             requestCounter++
             if (requestCounter % TEMP_EVERY_N == 0) {
                 DALY_TEMP_FRAMES[found]?.let {
@@ -529,7 +542,6 @@ class DalyBleManager(
                 }
             }
         } else {
-            // 아직 못 찾았으면 후보를 돌아가며 찔러본다
             val f = PROBE_FRAMES[probeIndex % PROBE_FRAMES.size]
             probeIndex++
             name = f.first
@@ -543,8 +555,6 @@ class DalyBleManager(
         Log.d(TAG, "TX($name): ${hex(frame)}")
 
         updateStatusLog(false)
-
-        // 응답이 안 오면 이 시점에 재시도 / 다음 후보로 넘어감
         scheduleNext(if (found != null) RESPONSE_TIMEOUT_MS else PROBE_INTERVAL_MS)
     }
 
@@ -554,7 +564,27 @@ class DalyBleManager(
         while (rxBuffer.size >= 4) {
             when (rxBuffer[0].toInt() and 0xFF) {
 
-                // ── JBD / Xiaoxiang: DD [cmd] [status] [len] <data> [crc 2B] 77
+                // ── LWS: 3A 16 [cmd] [len] <data> [cksum 2B LE] 0D 0A
+                0x3A -> {
+                    if ((rxBuffer[1].toInt() and 0xFF) != 0x16) {
+                        rxBuffer.removeAt(0); continue
+                    }
+                    val len = rxBuffer[3].toInt() and 0xFF
+                    val total = len + 8
+                    if (total > 300) { rxBuffer.removeAt(0); continue }
+                    if (rxBuffer.size < total) return
+                    val f = rxBuffer.subList(0, total).toList()
+                    // 꼬리가 0D 0A 인지 확인
+                    if ((f[total - 2].toInt() and 0xFF) != 0x0D ||
+                        (f[total - 1].toInt() and 0xFF) != 0x0A
+                    ) {
+                        rxBuffer.removeAt(0); continue
+                    }
+                    parseLws(f)
+                    rxBuffer.subList(0, total).clear()
+                }
+
+                // ── JBD: DD [cmd] [status] [len] <data> [crc 2B] 77
                 0xDD -> {
                     val len = rxBuffer[3].toInt() and 0xFF
                     val total = 4 + len + 3
@@ -570,7 +600,7 @@ class DalyBleManager(
                     }
                 }
 
-                // ── Daly: A5 [addr] [cmd] 08 <8 bytes> [cksum] = 13바이트
+                // ── Daly: A5 [addr] [cmd] 08 <8B> [cksum] = 13바이트
                 0xA5 -> {
                     if (rxBuffer.size < 13) return
                     val frame = rxBuffer.subList(0, 13).toList()
@@ -584,18 +614,61 @@ class DalyBleManager(
     }
 
     /**
-     * Daly 응답 처리.
+     * LWS 응답 (순정 앱 디컴파일로 실측한 오프셋).
+     *
+     * 0x2A(realtime) 데이터 배치 - 전부 리틀엔디안, 프레임 선두 기준 절대 위치:
+     *   [4..7]   전류   int32   mA
+     *   [8..11]  전압   uint32  mV
+     *   [12]     온도   int8    ℃
+     *   [16..19] 잔량   uint32  mAh
+     *   [20]     충전 MOSFET  (bit7)
+     *   [21]     방전 MOSFET  (bit7)
+     *   [24]     SOC    uint8   %
+     */
+    private fun parseLws(f: List<Byte>) {
+        val n = f.size
+        val len = f[3].toInt() and 0xFF
+        val cmd = f[2].toInt() and 0xFF
+
+        // 체크섬: e[1] .. e[n-5] 합 == 16비트 리틀엔디안
+        var sum = 0
+        for (i in 1..(n - 5)) sum += f[i].toInt() and 0xFF
+        val stored = ((f[n - 3].toInt() and 0xFF) shl 8) or (f[n - 4].toInt() and 0xFF)
+        if (sum != stored) {
+            Log.d(TAG, "LWS 체크섬 불일치: calc=$sum stored=$stored")
+            return
+        }
+
+        if (cmd != 0x2A || len < 21) return
+
+        val currentMa = s32le(f, 4)
+        val voltageMv = u32le(f, 8)
+        val tempC = f[12].toInt()               // 부호 있는 1바이트
+        val soc = f[24].toInt() and 0xFF
+
+        val v = voltageMv / 1000f
+        val a = currentMa / 1000f
+
+        if (v <= 0f || v > 200f) return
+        if (soc > 100) return
+
+        lockProtocol("LWS")
+        onParsed(v, a, soc.toFloat())
+        if (tempC > -40 && tempC < 150) onTemperature(tempC.toFloat())
+    }
+
+    /**
+     * Daly 응답.
      *  0x90 - 전압 / (예약) / 전류(+30000) / SOC, 각 2바이트 0.1단위
-     *  0x92 - 최고온도 / 최고온도셀 / 최저온도 / 최저온도셀, 각 1바이트 (+40 오프셋)
+     *  0x92 - 최고온도 (+40 오프셋)
      */
     private fun parseDaly(frame: List<Byte>) {
         when (frame[2].toInt() and 0xFF) {
-
             0x90 -> {
                 val v = u16(frame[4], frame[5]) / 10f
                 val a = (u16(frame[8], frame[9]) - 30000) / 10f
                 val s = u16(frame[10], frame[11]) / 10f
-                if (v <= 0f || v > 200f) return    // 말도 안 되는 값이면 버림
+                if (v <= 0f || v > 200f) return
                 lockProtocol(if (frame[1].toInt() and 0xFF == 0x01) "Daly(40)" else "Daly(80)")
                 onParsed(v, a, s)
             }
@@ -604,7 +677,6 @@ class DalyBleManager(
                 val maxT = (frame[4].toInt() and 0xFF) - 40
                 if (maxT in -40..150) {
                     onTemperature(maxT.toFloat())
-                    // 온도 응답도 하나의 왕복이므로 바로 다음 요청을 앞당긴다
                     if (detectedProtocol != null) scheduleNext(MIN_GAP_MS)
                 }
             }
@@ -614,7 +686,7 @@ class DalyBleManager(
     /**
      * JBD 0x03(기본정보) 응답.
      *  0-1 총전압(10mV)  2-3 전류(10mA)  19 SOC(%)
-     *  22 NTC 개수  23~ NTC 값 2바이트씩 (0.1K 단위)
+     *  22 NTC 개수  23~ NTC 값 2바이트씩 (0.1K)
      */
     private fun parseJbd(cmd: Int, d: List<Byte>) {
         if (cmd != 0x03 || d.size < 20) return
@@ -625,7 +697,6 @@ class DalyBleManager(
         lockProtocol("JBD")
         onParsed(v, a, s)
 
-        // 온도 센서는 여러 개일 수 있다. 가장 뜨거운 놈을 쓴다.
         val ntcCount = if (d.size > 22) d[22].toInt() and 0xFF else 0
         if (ntcCount in 1..8 && d.size >= 23 + ntcCount * 2) {
             var maxKelvin = 0
@@ -634,7 +705,7 @@ class DalyBleManager(
                 if (k > maxKelvin) maxKelvin = k
             }
             if (maxKelvin > 0) {
-                val c = (maxKelvin - 2731) / 10f   // 0.1K → ℃
+                val c = (maxKelvin - 2731) / 10f
                 if (c > -40f && c < 150f) onTemperature(c)
             }
         }
@@ -659,7 +730,6 @@ class DalyBleManager(
 
         onData(v, a, s)
 
-        // 여기가 핵심. 타임아웃까지 기다리지 않고 바로 다음 요청을 쏜다.
         if (detectedProtocol != null) scheduleNext(MIN_GAP_MS)
     }
 
@@ -671,12 +741,25 @@ class DalyBleManager(
         }
     }
 
+    // ── 숫자 변환 ──
+
     private fun u16(hi: Byte, lo: Byte): Int =
         ((hi.toInt() and 0xFF) shl 8) or (lo.toInt() and 0xFF)
 
     private fun s16(hi: Byte, lo: Byte): Int {
         val v = u16(hi, lo)
         return if (v > 32767) v - 65536 else v
+    }
+
+    private fun u32le(f: List<Byte>, i: Int): Long =
+        (f[i].toLong() and 0xFF) or
+                ((f[i + 1].toLong() and 0xFF) shl 8) or
+                ((f[i + 2].toLong() and 0xFF) shl 16) or
+                ((f[i + 3].toLong() and 0xFF) shl 24)
+
+    private fun s32le(f: List<Byte>, i: Int): Int {
+        val v = u32le(f, i)
+        return if (v > 2147483647L) (v - 4294967296L).toInt() else v.toInt()
     }
 
     @SuppressLint("MissingPermission")
